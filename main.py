@@ -7,10 +7,30 @@ import librosa.display
 import numpy as np
 import matplotlib.pyplot as plt
 
+from transformers import WhisperFeatureExtractor, WhisperForConditionalGeneration, WhisperTokenizer, WhisperProcessor, WhisperForConditionalGeneration
+
+def transcribe(file_path):
+    processor = WhisperProcessor.from_pretrained("openai/whisper-large-v3-turbo")
+    model = WhisperForConditionalGeneration.from_pretrained("openai/whisper-large-v3-turbo")
+
+
+    waveform, orig_sr = librosa.load(file_path, sr=16000, mono=True)
+
+    # Use the model and processor to transcribe the audio:
+    input_features = processor(waveform, sampling_rate=orig_sr, return_tensors="pt").input_features
+
+    # Generate token ids
+    predicted_ids = model.generate(input_features, language="russian")
+
+    # Decode token ids to text
+    transcription = processor.batch_decode(predicted_ids, skip_special_tokens=True)
+
+    return transcription[0]
+
 class Encoder(nn.Module):
     ''' Класс Encoder нейронной модели '''
     def __init__(self, 
-                 num_mels=128, # Число мэл уровней
+                 num_mels=80, # Число мэл уровней
                  d_model=512,  # Число скрытых признаков в слое
                  num_layers=6, # Число слоев (повторяющихся блоков Encoder)
                  n_heads=8,    # Число голов-внимания
@@ -57,7 +77,6 @@ class Encoder(nn.Module):
         x = x + self.pos_embedding[:, :x.shape[1], :]   # Добавляем позиционные эмбеддинги (:x.shape[1] - номер временного шага)
         x = self.encoder(x)                             # Проход Encoder-а
         return x
-
 
 class Decoder(nn.Module):
     def __init__(self, 
@@ -113,7 +132,6 @@ def extract_features(audio_path, sample_rate=16000, print_fig = False):
 
     # Добавить выравнивание частоты дискретизации до 16 КГц, если исходная частота не равна ей
 
-
     # Загружаем аудио
     waveform, orig_sr = librosa.load(audio_path, sr=sample_rate, mono=True)
 
@@ -128,17 +146,46 @@ def extract_features(audio_path, sample_rate=16000, print_fig = False):
         plt.colorbar()
         plt.show()
 
+    min_value = np.min(S_dB)
+
+    # Добавляем нулевые фреймы (до 3000)
+    if S_dB.shape[1] < 3000:
+        pad_width = 3000 - S_dB.shape[1]
+        S_dB = np.pad(S_dB, ((0, 0), (0, pad_width)), mode='constant', constant_values=min_value)
+
     mel_spec = np.expand_dims(S_dB, axis=0)  # добавление размерности для batch_size = 1
 
     return torch.tensor(mel_spec, dtype=torch.float32) # (1, n_mels, time_steps)
 
 # Пример использования
-audio_path = "F://asr_public_phone_calls_1/0/00/5d75b69a69b6.opus"  # Замените на путь к вашему файлу
-mel_spec = extract_features(audio_path)
+#audio_path = "F:/asr_public_phone_calls_1/0/5c646233c806.opus"  # Замените на путь к вашему файлу
+#mel_spec = extract_features(audio_path)
 
-encoder = Encoder()
+#encoder = Encoder()
 
-features = encoder(mel_spec)  # Выходная размерность: (batch, time_steps, d_model)
-print("Размерность скрытых признаков:", features.shape)  # Должно быть (1, 300, 512)
+#features = encoder(mel_spec)  # Выходная размерность: (batch, time_steps, d_model)
+#print("Размерность скрытых признаков:", features.shape)  # Должно быть (1, 300, 512)
 
-print(1)
+# processor = WhisperProcessor.from_pretrained("openai/whisper-large-v3-turbo")
+# model = WhisperForConditionalGeneration.from_pretrained("openai/whisper-large-v3-turbo")
+
+# predicted_ids = model.generate(mel_spec, language="russian")
+
+# transcription = processor.batch_decode(predicted_ids, skip_special_tokens=True)
+# transcription[0]
+
+#text = transcribe("F:/asr_public_phone_calls_1/0/4bc84bbfa234.opus")
+
+feauture_extractor = WhisperFeatureExtractor.from_pretrained("openai/whisper-large-v3-turbo")
+model = WhisperForConditionalGeneration.from_pretrained("openai/whisper-large-v3-turbo")
+tokenizer = WhisperTokenizer.from_pretrained("openai/whisper-large-v3-turbo", language = "russian")
+
+waveform, orig_sr = librosa.load("F:/asr_public_phone_calls_1/0/4bc84bbfa234.opus", sr=16000, mono=True)
+
+feature = feauture_extractor(waveform, return_tensors="pt").input_features
+
+generated_tokens = model.generate(input_features=feature)
+
+transcription = tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)[0]
+
+print(transcription)
