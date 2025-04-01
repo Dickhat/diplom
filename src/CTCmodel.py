@@ -139,9 +139,11 @@ class ASR_CTC_Model(nn.Module):
 class CustomAudioDataset(Dataset):
     def __init__(self, annotations_file, audio_dir, char_map):
         self.audio_target = pd.read_csv(annotations_file)
+
         # Очистка данных: Удаление строк с отсутствующими транскрипциями
         self.audio_target.dropna(subset=['text'], inplace=True)
         self.audio_target = self.audio_target[self.audio_target['text'].str.strip() != '']
+
         self.audio_dir = audio_dir
         self.char_map = char_map
         print(f"Загружено {len(self.audio_target)} записей после очистки.")
@@ -244,6 +246,7 @@ if __name__ == "__main__":
     # ---- Инициализация модели, лосса, оптимизатора ----
     model = ASR_CTC_Model(INPUT_DIM, HIDDEN_DIM, OUTPUT_DIM, NUM_LAYERS, DROPOUT).to(device)
     print(model) # Вывод структуры модели
+
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Общее количество обучаемых параметров: {total_params:,}")
 
@@ -251,6 +254,7 @@ if __name__ == "__main__":
     # Функция потерь CTC. blank=0 соответствует '_' в нашем алфавите
     ctc_loss = nn.CTCLoss(blank=char_map['_'], reduction='mean', zero_infinity=True).to(device)
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY) # AdamW лучше с weight decay
+    
     # Планировщик для уменьшения LR, если loss на валидации не улучшается
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3, verbose=True)
 
