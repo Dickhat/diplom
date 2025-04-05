@@ -87,6 +87,8 @@ class ASR_CTC_Model(nn.Module):
         # F_out = input_dim // 4 (из-за stride=(2,2) дважды)
         lstm_input_dim = 32 * (input_dim // 4)
 
+        self.conv_dropout = nn.Dropout(dropout)
+
         self.lstm = nn.LSTM(
             lstm_input_dim,
             hidden_dim,
@@ -95,6 +97,8 @@ class ASR_CTC_Model(nn.Module):
             bidirectional=True,
             dropout=dropout if num_layers > 1 else 0 # Dropout между слоями LSTM
         )
+        
+        self.fc_dropout = nn.Dropout(dropout)
         self.fc = nn.Linear(hidden_dim * 2, output_dim)  # Bidirectional -> *2
         # LogSoftmax применяется в конце
 
@@ -212,7 +216,7 @@ if __name__ == "__main__":
     HIDDEN_DIM = 512     # Число скрытых признаков LSTM
     OUTPUT_DIM = len(RUSSIAN_ALPHABET)
     NUM_LAYERS = 4       # Число слоев LSTM
-    DROPOUT = 0.15       # Обрубание весов
+    DROPOUT = 0.25       # Обрубание весов
     BATCH_SIZE = 16      # Число обрабатываемых аудио за проход
     NUM_EPOCHS = 50      # Число эпох обучения
     LEARNING_RATE = 1e-4 # Уменьшили, т.к. Adam с большими моделями лучше сходится с меньшим LR
@@ -221,7 +225,10 @@ if __name__ == "__main__":
     ANNOTATIONS_FILE = "./dataset_target.csv"    # Путь к CSV с метками датасета
     AUDIO_DIR = "F:/asr_public_phone_calls_1/0/" # Путь к папке с аудио
     MODEL_SAVE_PATH = "asr_ctc_model_best.pth"   # Путь сохранения модели
-    TRAIN_SPLIT_RATIO = 0.9 # 90% на обучение, 10% на валидацию
+    TRAIN_SPLIT_RATIO = 0.9     # 90% на обучение, 10% на валидацию
+    PATIENCE_SCHEDULER = 2      #для ReduceLROnPlateau
+    PATIENCE_EARLY_STOPPING = 7 # остановка после N эпох без улучшений
+
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Используется устройство: {device}")
@@ -243,11 +250,11 @@ if __name__ == "__main__":
     train_dataloader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn_asr, num_workers=4, pin_memory=True if device == 'cuda' else False)
     val_dataloader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn_asr, num_workers=4, pin_memory=True if device == 'cuda' else False)
 
-    # ---- Инициализация модели, лосса, оптимизатора ----
+    # Инициализация модели
     model = ASR_CTC_Model(INPUT_DIM, HIDDEN_DIM, OUTPUT_DIM, NUM_LAYERS, DROPOUT).to(device)
     print(model) # Вывод структуры модели
 
-    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)   
     print(f"Общее количество обучаемых параметров: {total_params:,}")
 
 
@@ -256,10 +263,11 @@ if __name__ == "__main__":
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY) # AdamW лучше с weight decay
     
     # Планировщик для уменьшения LR, если loss на валидации не улучшается
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3, verbose=True)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=PATIENCE_SCHEDULER, verbose=True)
 
     # ---- Цикл обучения и валидации ----
     best_val_loss = float('inf')
+    epochs_no_improve = 0 # <--- Счетчик для ранней остановки
 
     for epoch in range(NUM_EPOCHS):
         start_time_epoch = time.time()
@@ -267,6 +275,8 @@ if __name__ == "__main__":
         model.train()
         train_loss_accum = 0.0
         processed_batches_train = 0
+
+        # Прогон по batch-ам
         for batch_idx, (inputs, targets, input_lengths, target_lengths) in enumerate(train_dataloader):
             # Пропускаем батч, если он пустой (из-за ошибок в collate_fn)
             if inputs is None:
@@ -369,12 +379,11 @@ if __name__ == "__main__":
                          decoded_text = int_to_text(pred_indices, index_map)
                          # Найти соответствующий таргет для этого примера
                          # Таргеты конкатенированы, нужно извлечь нужный сегмент
-                         start_idx = sum(target_lengths[:i]).item()
+                         start_idx = sum(target_lengths[:i]) #.item()
                          end_idx = start_idx + target_lengths[i].item()
                          target_indices = targets[start_idx:end_idx].cpu().tolist()
                          target_text = int_to_text(target_indices, index_map) # Декодируем для сравнения
                          example_predictions.append((decoded_text, target_text))
-
 
         avg_val_loss = val_loss_accum / processed_batches_val if processed_batches_val > 0 else 0.0
         epoch_duration = time.time() - start_time_epoch
@@ -395,6 +404,15 @@ if __name__ == "__main__":
             best_val_loss = avg_val_loss
             torch.save(model.state_dict(), MODEL_SAVE_PATH)
             print(f"  Validation loss улучшился. Модель сохранена в {MODEL_SAVE_PATH}")
+            epochs_no_improve = 0 # Сброс счетчика
+        else:
+            epochs_no_improve += 1
+            print(f"  Validation loss не улучшился. Эпох без улучшения: {epochs_no_improve}/{PATIENCE_EARLY_STOPPING}")
+
+        if epochs_no_improve >= PATIENCE_EARLY_STOPPING:
+            print(f"\nРанняя остановка! Validation loss не улучшался {PATIENCE_EARLY_STOPPING} эпох.")
+            break # Выход из цикла обучения
+
         print("-" * 50)
 
     print("Обучение завершено.")
@@ -404,34 +422,33 @@ if __name__ == "__main__":
     model.load_state_dict(torch.load(MODEL_SAVE_PATH, map_location=device))
     model.eval()
 
-    # Возьмем пример аудиофайла (замените на реальный путь)
-    # example_audio_path = "F:/asr_public_phone_calls_1/0/bb103c9bf636.opus"
-    # Используем первый файл из валидационного сета для примера
+    # Используем первые 100 файлов из датасета для примера
     try:
-        example_idx_in_full = val_dataset.indices[0] # Индекс в исходном датасете
-        example_audio_filename = full_dataset.audio_target.iloc[example_idx_in_full, 0]
-        example_audio_path = os.path.join(AUDIO_DIR, example_audio_filename + ".opus") # или .wav
-        print(f"Пример аудио для предсказания: {example_audio_path}")
+        for index in range(100):
+            #example_idx_in_full = val_dataset.indices[index] # Индекс в исходном датасете
+            example_idx_in_full = train_dataset.indices[index] # Индекс в исходном датасете
+            example_audio_filename = full_dataset.audio_target.iloc[example_idx_in_full, 0]
+            example_audio_path = os.path.join(AUDIO_DIR, example_audio_filename + ".opus") # или .wav
+            print(f"Пример аудио для предсказания: {example_audio_path}")
 
-        input_tensor = preprocess_audio(example_audio_path)
+            input_tensor = preprocess_audio(example_audio_path)
 
-        if input_tensor is not None:
-            input_tensor = input_tensor.unsqueeze(0).to(device) # Добавляем batch измерение
+            if input_tensor is not None:
+                input_tensor = input_tensor.unsqueeze(0).to(device) # Добавляем batch измерение
 
-            with torch.no_grad():
-                output = model(input_tensor) # (1, T', output_dim)
-                predicted_indices = torch.argmax(output, dim=2).squeeze(0).cpu().tolist()
-                decoded_text = int_to_text(predicted_indices, index_map)
-                print(f"\nПредсказание для {example_audio_path}:")
-                print(f"  Декодированный текст (жадный поиск): '{decoded_text}'")
+                with torch.no_grad():
+                    output = model(input_tensor) # (1, T', output_dim)
+                    predicted_indices = torch.argmax(output, dim=2).squeeze(0).cpu().tolist()
+                    decoded_text = int_to_text(predicted_indices, index_map)
+                    print(f"\nПредсказание для {example_audio_path}:")
+                    print(f"  Декодированный текст (жадный поиск): '{decoded_text}'")
 
-                # Получим реальный текст для сравнения
-                real_text = full_dataset.audio_target.iloc[example_idx_in_full, 1]
-                print(f"  Реальный текст: '{real_text.lower()}'")
-
-        else:
-             print(f"Не удалось обработать пример аудио: {example_audio_path}")
-
+                    # Получим реальный текст для сравнения
+                    real_text = full_dataset.audio_target.iloc[example_idx_in_full, 1]
+                    print(f"  Реальный текст: '{real_text.lower()}'")
+            else:
+                print(f"Не удалось обработать пример аудио: {example_audio_path}")
+        print(1)
     except IndexError:
         print("Не удалось получить пример из валидационного датасета.")
     except FileNotFoundError:
