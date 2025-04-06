@@ -13,13 +13,11 @@ from sklearn.model_selection import train_test_split
 import time # Для замера времени эпохи
 
 # Русский алфавит + пробел + пустой символ CTC
-# Добавим '_' как явный пустой символ для CTC (хотя пробел тоже часто используется)
-# Убедимся, что пустой символ имеет индекс 0 для nn.CTCLoss (blank=0 по умолчанию)
 RUSSIAN_ALPHABET = "_абвгдеёжзийклмнопрстуфхцчшщъыьэюя " # Пробел в конце
 char_map = {char: idx for idx, char in enumerate(RUSSIAN_ALPHABET)}
 index_map = {idx: char for char, idx in char_map.items()}
 
-# ---- Функции кодирования/декодирования текста ----
+# Функции кодирования/декодирования текста
 def text_to_int(text, char_map):
     """Преобразует текст в индексы по `char_map`."""
     # Приводим к нижнему регистру и удаляем символы не из алфавита
@@ -43,7 +41,7 @@ def int_to_text(indices, index_map):
     text = ' '.join(text.split())
     return text
 
-# ---- Улучшенная обработка аудио ----
+# Улучшенная обработка аудио
 def preprocess_audio(audio_path, sample_rate=16000, n_mels=80, n_fft=400, hop_length=160):
     """Загружает аудио, преобразует в лог-мел-спектрограмму и нормализует."""
     try:
@@ -138,8 +136,7 @@ class ASR_CTC_Model(nn.Module):
 
         return lengths
 
-
-# ---- Датасет ----
+# Датасет 
 class CustomAudioDataset(Dataset):
     def __init__(self, annotations_file, audio_dir, char_map):
         self.audio_target = pd.read_csv(annotations_file)
@@ -184,7 +181,7 @@ class CustomAudioDataset(Dataset):
 
         return log_mel_spectrogram, label_tensor
 
-# ---- Функция для сборки батча (collate_fn) ----
+# Функция для сборки батча
 def collate_fn_asr(batch):
     # Фильтруем None элементы, которые могли возникнуть из-за ошибок в __getitem__
     batch = [(spec, target) for spec, target in batch if spec is not None]
@@ -209,31 +206,46 @@ def collate_fn_asr(batch):
 
     return inputs_padded, targets_concatenated, input_lengths, target_lengths
 
+# Транскрибация аудио
+def transcribe_audio(model, path):
+    input_tensor = preprocess_audio(path)
+
+    if input_tensor is not None:
+        input_tensor = input_tensor.unsqueeze(0).to(device) # Добавляем batch измерение
+
+        with torch.no_grad():
+            output = model(input_tensor) # (1, T', output_dim)
+            predicted_indices = torch.argmax(output, dim=2).squeeze(0).cpu().tolist()
+            decoded_text = int_to_text(predicted_indices, index_map)
+            print(f"\nПредсказание для {path}:")
+            print(f"  Декодированный текст (жадный поиск): '{decoded_text}'")
+    else:
+        print(f"Не удалось обработать пример аудио: {path}")
 
 if __name__ == "__main__":
-    # ---- Гиперпараметры ----
-    INPUT_DIM = 80       # n_mels число уровней мэл
-    HIDDEN_DIM = 512     # Число скрытых признаков LSTM
+    # Гиперпараметры
+    INPUT_DIM = 80                               # n_mels число уровней мэл
+    HIDDEN_DIM = 512                             # Число скрытых признаков LSTM
     OUTPUT_DIM = len(RUSSIAN_ALPHABET)
-    NUM_LAYERS = 4       # Число слоев LSTM
-    DROPOUT = 0.25       # Обрубание весов
-    BATCH_SIZE = 16      # Число обрабатываемых аудио за проход
-    NUM_EPOCHS = 50      # Число эпох обучения
-    LEARNING_RATE = 1e-4 # Уменьшили, т.к. Adam с большими моделями лучше сходится с меньшим LR
-    WEIGHT_DECAY = 1e-5  # Небольшая L2 регуляризация
-    CLIP_GRAD_NORM = 5.0 # Для предотвращения взрыва градиентов
+    NUM_LAYERS = 4                               # Число слоев LSTM
+    DROPOUT = 0.25                               # Обрубание весов
+    BATCH_SIZE = 16                              # Число обрабатываемых аудио за проход
+    NUM_EPOCHS = 50                              # Число эпох обучения
+    LEARNING_RATE = 1e-4                         # Adam с большими моделями лучше сходится с меньшим LR
+    WEIGHT_DECAY = 1e-5                          # Небольшая L2 регуляризация
+    CLIP_GRAD_NORM = 5.0                         # Для предотвращения взрыва градиентов
     ANNOTATIONS_FILE = "./dataset_target.csv"    # Путь к CSV с метками датасета
     AUDIO_DIR = "F:/asr_public_phone_calls_1/0/" # Путь к папке с аудио
     MODEL_SAVE_PATH = "asr_ctc_model_best.pth"   # Путь сохранения модели
-    TRAIN_SPLIT_RATIO = 0.9     # 90% на обучение, 10% на валидацию
-    PATIENCE_SCHEDULER = 2      #для ReduceLROnPlateau
-    PATIENCE_EARLY_STOPPING = 7 # остановка после N эпох без улучшений
+    TRAIN_SPLIT_RATIO = 0.9                      # 90% на обучение, 10% на валидацию
+    PATIENCE_SCHEDULER = 2                       # для ReduceLROnPlateau
+    PATIENCE_EARLY_STOPPING = 7                  # остановка после N эпох без улучшений
 
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Используется устройство: {device}")
 
-    # ---- Загрузка и разделение данных ----
+    # Загрузка и разделение данных
     full_dataset = CustomAudioDataset(ANNOTATIONS_FILE, AUDIO_DIR, char_map)
 
     if len(full_dataset) == 0:
@@ -258,178 +270,179 @@ if __name__ == "__main__":
     print(f"Общее количество обучаемых параметров: {total_params:,}")
 
 
-    # Функция потерь CTC. blank=0 соответствует '_' в нашем алфавите
+    # Функция потерь CTC. blank=0 соответствует '_' в алфавите
     ctc_loss = nn.CTCLoss(blank=char_map['_'], reduction='mean', zero_infinity=True).to(device)
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY) # AdamW лучше с weight decay
     
     # Планировщик для уменьшения LR, если loss на валидации не улучшается
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=PATIENCE_SCHEDULER, verbose=True)
 
-    # ---- Цикл обучения и валидации ----
+    # Цикл обучения и валидации
     best_val_loss = float('inf')
-    epochs_no_improve = 0 # <--- Счетчик для ранней остановки
+    epochs_no_improve = 0 # Счетчик для ранней остановки
 
-    for epoch in range(NUM_EPOCHS):
-        start_time_epoch = time.time()
-        # --- Обучение ---
-        model.train()
-        train_loss_accum = 0.0
-        processed_batches_train = 0
+    # for epoch in range(NUM_EPOCHS):
+    #     start_time_epoch = time.time()
 
-        # Прогон по batch-ам
-        for batch_idx, (inputs, targets, input_lengths, target_lengths) in enumerate(train_dataloader):
-            # Пропускаем батч, если он пустой (из-за ошибок в collate_fn)
-            if inputs is None:
-                print(f"Пропущен пустой батч {batch_idx + 1} в обучении.")
-                continue
+    #     model.train()
+    #     train_loss_accum = 0.0
+    #     processed_batches_train = 0
 
-            inputs = inputs.to(device)
-            targets = targets.to(device) # Уже конкатенированы
-            input_lengths = input_lengths.to(device)
-            target_lengths = target_lengths.to(device)
+    #     # Прогон по batch-ам
+    #     for batch_idx, (inputs, targets, input_lengths, target_lengths) in enumerate(train_dataloader):
+    #         # Пропускаем батч, если он пустой (из-за ошибок в collate_fn)
+    #         if inputs is None:
+    #             print(f"Пропущен пустой батч {batch_idx + 1} в обучении.")
+    #             continue
 
-            optimizer.zero_grad()
+    #         inputs = inputs.to(device)
+    #         targets = targets.to(device)
+    #         input_lengths = input_lengths.to(device)
+    #         target_lengths = target_lengths.to(device)
 
-            # Forward pass
-            outputs = model(inputs) # (batch, T_prime, output_dim)
+    #         optimizer.zero_grad()
 
-            # Рассчитываем длины выходов после сверток для CTC Loss
-            output_lengths = model.get_output_lengths(input_lengths).to(device)
+    #         # Forward pass
+    #         outputs = model(inputs) # (batch, T_prime, output_dim)
 
-            # Permute для CTC Loss: (T_prime, batch, output_dim)
-            log_probs = outputs.permute(1, 0, 2)
+    #         # Рассчитываем длины выходов после сверток для CTC Loss
+    #         output_lengths = model.get_output_lengths(input_lengths).to(device)
 
-            # Проверка на валидность длин для CTC Loss
-            # Длина выхода не может быть меньше длины таргета
-            valid_indices = output_lengths >= target_lengths
-            if not valid_indices.all():
-                print(f"Предупреждение: Пропущен батч {batch_idx+1} из-за output_lengths < target_lengths.")
-                # print("Output lengths:", output_lengths[~valid_indices])
-                # print("Target lengths:", target_lengths[~valid_indices])
-                continue # Пропускаем этот батч
+    #         # Permute для CTC Loss: (T_prime, batch, output_dim)
+    #         log_probs = outputs.permute(1, 0, 2)
 
-            # Расчет CTC Loss
-            try:
-                 loss = ctc_loss(log_probs, targets, output_lengths, target_lengths)
-            except Exception as e:
-                 print(f"Ошибка в CTC Loss на батче {batch_idx+1}: {e}")
-                 print("log_probs shape:", log_probs.shape)
-                 print("targets shape:", targets.shape)
-                 print("output_lengths:", output_lengths)
-                 print("target_lengths:", target_lengths)
-                 continue # Пропускаем этот батч
+    #         # Проверка на валидность длин для CTC Loss. Длина выхода не может быть меньше длины таргета
+    #         valid_indices = output_lengths >= target_lengths
+    #         if not valid_indices.all():
+    #             print(f"Предупреждение: Пропущен батч {batch_idx+1} из-за output_lengths < target_lengths.")
+    #             # print("Output lengths:", output_lengths[~valid_indices])
+    #             # print("Target lengths:", target_lengths[~valid_indices])
+    #             continue # Пропускаем этот батч
 
-            # Backward pass и оптимизация
-            loss.backward()
+    #         # Расчет CTC Loss
+    #         try:
+    #              loss = ctc_loss(log_probs, targets, output_lengths, target_lengths)
+    #         except Exception as e:
+    #              print(f"Ошибка в CTC Loss на батче {batch_idx+1}: {e}")
+    #              print("log_probs shape:", log_probs.shape)
+    #              print("targets shape:", targets.shape)
+    #              print("output_lengths:", output_lengths)
+    #              print("target_lengths:", target_lengths)
+    #              continue # Пропускаем этот батч
 
-            # Обрезка градиентов
-            torch.nn.utils.clip_grad_norm_(model.parameters(), CLIP_GRAD_NORM)
+    #         # Backward pass и оптимизация
+    #         loss.backward()
 
-            optimizer.step()
+    #         # Обрезка градиентов
+    #         torch.nn.utils.clip_grad_norm_(model.parameters(), CLIP_GRAD_NORM)
 
-            train_loss_accum += loss.item()
-            processed_batches_train += 1
+    #         optimizer.step()
 
-            if (batch_idx + 1) % 20 == 0: # Печатаем прогресс каждые 20 батчей
-                print(f"Epoch {epoch+1}/{NUM_EPOCHS}, Batch {batch_idx+1}/{len(train_dataloader)}, Train Loss: {loss.item():.4f}")
+    #         train_loss_accum += loss.item()
+    #         processed_batches_train += 1
 
-        avg_train_loss = train_loss_accum / processed_batches_train if processed_batches_train > 0 else 0.0
+    #         if (batch_idx + 1) % 20 == 0: # Печатаем прогресс каждые 20 батчей
+    #             print(f"Epoch {epoch+1}/{NUM_EPOCHS}, Batch {batch_idx+1}/{len(train_dataloader)}, Train Loss: {loss.item():.4f}")
 
-        # --- Валидация ---
-        model.eval()
-        val_loss_accum = 0.0
-        processed_batches_val = 0
-        example_predictions = [] # Сохраним несколько примеров
+    #     avg_train_loss = train_loss_accum / processed_batches_train if processed_batches_train > 0 else 0.0
 
-        with torch.no_grad():
-            for batch_idx, (inputs, targets, input_lengths, target_lengths) in enumerate(val_dataloader):
-                if inputs is None:
-                    print(f"Пропущен пустой батч {batch_idx + 1} в валидации.")
-                    continue
+    #     # Валидация
+    #     model.eval()
+    #     val_loss_accum = 0.0
+    #     processed_batches_val = 0
+    #     example_predictions = [] # Сохраним несколько примеров
 
-                inputs = inputs.to(device)
-                targets = targets.to(device)
-                input_lengths = input_lengths.to(device)
-                target_lengths = target_lengths.to(device)
+    #     with torch.no_grad():
+    #         for batch_idx, (inputs, targets, input_lengths, target_lengths) in enumerate(val_dataloader):
+    #             if inputs is None:
+    #                 print(f"Пропущен пустой батч {batch_idx + 1} в валидации.")
+    #                 continue
 
-                outputs = model(inputs) # (batch, T_prime, output_dim)
-                output_lengths = model.get_output_lengths(input_lengths).to(device)
-                log_probs = outputs.permute(1, 0, 2) # (T_prime, batch, output_dim)
+    #             inputs = inputs.to(device)
+    #             targets = targets.to(device)
+    #             input_lengths = input_lengths.to(device)
+    #             target_lengths = target_lengths.to(device)
 
-                valid_indices = output_lengths >= target_lengths
-                if not valid_indices.all():
-                   print(f"Предупреждение: Пропущен валидационный батч {batch_idx+1} из-за output_lengths < target_lengths.")
-                   continue
+    #             outputs = model(inputs) # (batch, T_prime, output_dim)
+    #             output_lengths = model.get_output_lengths(input_lengths).to(device)
+    #             log_probs = outputs.permute(1, 0, 2) # (T_prime, batch, output_dim)
 
-                try:
-                    loss = ctc_loss(log_probs, targets, output_lengths, target_lengths)
-                except Exception as e:
-                    print(f"Ошибка в CTC Loss на валидационном батче {batch_idx+1}: {e}")
-                    continue
+    #             valid_indices = output_lengths >= target_lengths
+    #             if not valid_indices.all():
+    #                print(f"Предупреждение: Пропущен валидационный батч {batch_idx+1} из-за output_lengths < target_lengths.")
+    #                continue
 
-                val_loss_accum += loss.item()
-                processed_batches_val += 1
+    #             try:
+    #                 loss = ctc_loss(log_probs, targets, output_lengths, target_lengths)
+    #             except Exception as e:
+    #                 print(f"Ошибка в CTC Loss на валидационном батче {batch_idx+1}: {e}")
+    #                 continue
 
-                # Сохраним примеры из первого валидационного батча
-                if batch_idx == 0 and len(example_predictions) < 5:
-                     # Жадное декодирование для примера
-                     preds = torch.argmax(outputs, dim=2) # (batch, T_prime)
-                     for i in range(min(len(outputs), 5 - len(example_predictions))):
-                         pred_indices = preds[i].cpu().tolist()
-                         decoded_text = int_to_text(pred_indices, index_map)
-                         # Найти соответствующий таргет для этого примера
-                         # Таргеты конкатенированы, нужно извлечь нужный сегмент
-                         start_idx = sum(target_lengths[:i]) #.item()
-                         end_idx = start_idx + target_lengths[i].item()
-                         target_indices = targets[start_idx:end_idx].cpu().tolist()
-                         target_text = int_to_text(target_indices, index_map) # Декодируем для сравнения
-                         example_predictions.append((decoded_text, target_text))
+    #             val_loss_accum += loss.item()
+    #             processed_batches_val += 1
 
-        avg_val_loss = val_loss_accum / processed_batches_val if processed_batches_val > 0 else 0.0
-        epoch_duration = time.time() - start_time_epoch
+    #             # Сохраним примеры из первого валидационного батча
+    #             if batch_idx == 0 and len(example_predictions) < 5:
+    #                  # Жадное декодирование для примера
+    #                  preds = torch.argmax(outputs, dim=2) # (batch, T_prime)
+    #                  for i in range(min(len(outputs), 5 - len(example_predictions))):
+    #                      pred_indices = preds[i].cpu().tolist()
+    #                      decoded_text = int_to_text(pred_indices, index_map)
+    #                      # Найти соответствующий таргет для этого примера
+    #                      # Таргеты конкатенированы, нужно извлечь нужный сегмент
+    #                      start_idx = sum(target_lengths[:i]) #.item()
+    #                      end_idx = start_idx + target_lengths[i].item()
+    #                      target_indices = targets[start_idx:end_idx].cpu().tolist()
+    #                      target_text = int_to_text(target_indices, index_map) # Декодируем для сравнения
+    #                      example_predictions.append((decoded_text, target_text))
 
-        print(f"\nEpoch {epoch+1}/{NUM_EPOCHS} Summary:")
-        print(f"  Duration: {epoch_duration:.2f}s")
-        print(f"  Avg Train Loss: {avg_train_loss:.4f}")
-        print(f"  Avg Val Loss: {avg_val_loss:.4f}")
-        print("  Example Predictions (Predicted | Target):")
-        for pred, target in example_predictions:
-            print(f"    - '{pred}' | '{target}'")
+    #     avg_val_loss = val_loss_accum / processed_batches_val if processed_batches_val > 0 else 0.0
+    #     epoch_duration = time.time() - start_time_epoch
 
-        # Обновление learning rate
-        scheduler.step(avg_val_loss)
+    #     print(f"\nEpoch {epoch+1}/{NUM_EPOCHS} Summary:")
+    #     print(f"  Duration: {epoch_duration:.2f}s")
+    #     print(f"  Avg Train Loss: {avg_train_loss:.4f}")
+    #     print(f"  Avg Val Loss: {avg_val_loss:.4f}")
+    #     print("  Example Predictions (Predicted | Target):")
+    #     for pred, target in example_predictions:
+    #         print(f"    - '{pred}' | '{target}'")
 
-        # Сохранение лучшей модели
-        if avg_val_loss < best_val_loss:
-            best_val_loss = avg_val_loss
-            torch.save(model.state_dict(), MODEL_SAVE_PATH)
-            print(f"  Validation loss улучшился. Модель сохранена в {MODEL_SAVE_PATH}")
-            epochs_no_improve = 0 # Сброс счетчика
-        else:
-            epochs_no_improve += 1
-            print(f"  Validation loss не улучшился. Эпох без улучшения: {epochs_no_improve}/{PATIENCE_EARLY_STOPPING}")
+    #     # Обновление learning rate
+    #     scheduler.step(avg_val_loss)
 
-        if epochs_no_improve >= PATIENCE_EARLY_STOPPING:
-            print(f"\nРанняя остановка! Validation loss не улучшался {PATIENCE_EARLY_STOPPING} эпох.")
-            break # Выход из цикла обучения
+    #     # Сохранение лучшей модели
+    #     if avg_val_loss < best_val_loss:
+    #         best_val_loss = avg_val_loss
+    #         torch.save(model.state_dict(), MODEL_SAVE_PATH)
+    #         print(f"  Validation loss улучшился. Модель сохранена в {MODEL_SAVE_PATH}")
+    #         epochs_no_improve = 0 # Сброс счетчика
+    #     else:
+    #         epochs_no_improve += 1
+    #         print(f"  Validation loss не улучшился. Эпох без улучшения: {epochs_no_improve}/{PATIENCE_EARLY_STOPPING}")
 
-        print("-" * 50)
+    #     if epochs_no_improve >= PATIENCE_EARLY_STOPPING:
+    #         print(f"\nРанняя остановка! Validation loss не улучшался {PATIENCE_EARLY_STOPPING} эпох.")
+    #         break # Выход из цикла обучения
 
-    print("Обучение завершено.")
+    #     print("-" * 50)
 
-    # ---- Пример использования обученной модели ----
+    # print("Обучение завершено.")
+
+    # Пример использования обученной модели 
     print("\nЗагрузка лучшей модели для предсказания...")
     model.load_state_dict(torch.load(MODEL_SAVE_PATH, map_location=device))
     model.eval()
 
+    transcribe_audio(model, "C:/Users/danya/Desktop/Record (online-voice-recorder.com).mp3")
+
     # Используем первые 100 файлов из датасета для примера
     try:
         for index in range(100):
-            #example_idx_in_full = val_dataset.indices[index] # Индекс в исходном датасете
-            example_idx_in_full = train_dataset.indices[index] # Индекс в исходном датасете
+            example_idx_in_full = val_dataset.indices[index] # Индекс в валидационном датасете
+            #example_idx_in_full = train_dataset.indices[index] # Индекс в обучающем датасете
             example_audio_filename = full_dataset.audio_target.iloc[example_idx_in_full, 0]
             example_audio_path = os.path.join(AUDIO_DIR, example_audio_filename + ".opus") # или .wav
-            print(f"Пример аудио для предсказания: {example_audio_path}")
+            #print(f"Пример аудио для предсказания: {example_audio_path}")
 
             input_tensor = preprocess_audio(example_audio_path)
 
