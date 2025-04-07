@@ -3,7 +3,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader, random_split
+from torch.utils.data import Dataset, DataLoader, Subset, random_split
 from torch.nn.utils.rnn import pad_sequence
 import matplotlib.pyplot as plt
 import librosa
@@ -11,6 +11,9 @@ import librosa.display
 import numpy as np
 from sklearn.model_selection import train_test_split
 import time # Для замера времени эпохи
+
+from tqdm import tqdm
+import jiwer
 
 # Русский алфавит + пробел + пустой символ CTC
 RUSSIAN_ALPHABET = "_абвгдеёжзийклмнопрстуфхцчшщъыьэюя " # Пробел в конце
@@ -112,8 +115,12 @@ class ASR_CTC_Model(nn.Module):
         x = x.permute(0, 2, 1, 3) # -> (batch, T', channels, F')
         x = x.reshape(batch_size, T_prime, channels * F_prime) # -> (batch, T', channels * F')
 
+        x = self.conv_dropout(x)
+
         # Применяем LSTM
         x, _ = self.lstm(x) # -> (batch, T', hidden_dim * 2)
+
+        x = self.fc_dropout(x)
 
         # Применяем полносвязный слой
         x = self.fc(x) # -> (batch, T', output_dim)
@@ -206,6 +213,24 @@ def collate_fn_asr(batch):
 
     return inputs_padded, targets_concatenated, input_lengths, target_lengths
 
+def wer_collate_fn_asr(batch):
+    # Проверяем, что первый элемент (спектрограмма) не None
+    batch = [(spec, target_tensor, target_text) for spec, target_tensor, target_text in batch if spec is not None]
+    if not batch:
+        # Возвращаем 5 None, как ожидает цикл обработки батча
+        return None, None, None, None, None 
+
+    # Разделяем спектрограммы, тензоры меток и текстовые метки
+    inputs, targets_tensor, targets_text = zip(*batch)
+
+    input_lengths = torch.tensor([x.shape[0] for x in inputs], dtype=torch.long)
+    target_lengths = torch.tensor([len(t) for t in targets_tensor], dtype=torch.long)
+    inputs_padded = pad_sequence(inputs, batch_first=True, padding_value=0.0)
+    targets_concatenated = torch.cat(targets_tensor)
+
+    # Возвращаем и список оригинальных текстов
+    return inputs_padded, targets_concatenated, input_lengths, target_lengths, list(targets_text) 
+
 # Транскрибация аудио
 def transcribe_audio(model, path):
     input_tensor = preprocess_audio(path)
@@ -222,25 +247,100 @@ def transcribe_audio(model, path):
     else:
         print(f"Не удалось обработать пример аудио: {path}")
 
+
+@torch.no_grad() # Важно: отключаем расчет градиентов для экономии памяти и ускорения
+def evaluate_wer(model, train_dataloader, device, index_map):
+    """
+    Рассчитывает Word Error Rate (WER) для модели на заданном датасете.
+
+    Args:
+        model (nn.Module): Обученная модель ASR.
+        dataloader (DataLoader): DataLoader для набора данных (валидационного или тестового).
+                                 Dataset должен возвращать (спектрограмма, таргет_тензор, таргет_текст).
+                                 collate_fn должен возвращать (inputs, targets_tensor, input_lengths, target_lengths, ref_texts).
+        device (torch.device): Устройство (CPU или CUDA) для вычислений.
+        index_map (dict): Словарь для преобразования индексов в символы.
+
+    Returns:
+        float: Рассчитанный WER.
+        list: Список всех эталонных текстов.
+        list: Список всех предсказанных текстов.
+    """
+
+    model.eval() # Переводим модель в режим оценки (отключает dropout и т.п.)
+    all_predictions = []
+    all_references = []
+
+    print("Начало оценки WER...")
+    for batch_data in tqdm(train_dataloader, desc="WER Evaluation"):
+        if batch_data[0] is None: continue # Проверка на пустой батч
+
+        # Получаем данные из батча (таргеты-тензоры и их длины не нужны для WER)
+        inputs, targets, input_lengths, target_lengths = batch_data
+
+        inputs = inputs.to(device)
+        input_lengths_dev = input_lengths.to(device) # Длины могут понадобиться для get_output_lengths
+
+        # Получаем выходы модели
+        outputs = model(inputs) # (B, T', C)
+        # Получаем реальные длины выходов после сверток/пулинга
+        output_lengths = model.get_output_lengths(input_lengths_dev) # (B)
+
+        # Greedy декодирование
+        preds_indices = torch.argmax(outputs, dim=2) # (B, T')
+        preds_indices_cpu = preds_indices.cpu().tolist()
+        output_lengths_cpu = output_lengths.cpu().tolist()
+
+        # Декодируем каждый элемент батча
+        for i in range(len(inputs)):
+            actual_len = output_lengths_cpu[i]
+            if actual_len <= 0 : continue # Пропускаем, если модель выдала нулевую длину
+
+            # Таргеты конкатенированы, нужно извлечь нужный сегмент
+            start_idx = sum(target_lengths[:i]) #.item()
+            end_idx = start_idx + target_lengths[i].item()
+            target_indices = targets[start_idx:end_idx].cpu().tolist()
+            target_text = int_to_text(target_indices, index_map) # Декодируем для сравнения
+
+            # Обрезаем и декодируем предсказание
+            pred_text = int_to_text(preds_indices_cpu[i][:actual_len], index_map)
+
+            all_predictions.append(pred_text)
+            all_references.append(target_text)
+
+    # Расчет итогового WER
+    calculated_wer = float('inf') # Значение по умолчанию на случай ошибки
+    if all_references and all_predictions:
+        print("Расчет WER...")
+        try:
+            calculated_wer = jiwer.wer(all_references, all_predictions)
+            print(f"Ошибка WER = {calculated_wer}%")
+        except Exception as e:
+            print(f"Ошибка при расчете WER с помощью jiwer: {e}")
+    else:
+        print("Предупреждение: Не удалось собрать предсказания или референсы для расчета WER.")
+
+    return calculated_wer, all_references, all_predictions
+
 if __name__ == "__main__":
     # Гиперпараметры
     INPUT_DIM = 80                               # n_mels число уровней мэл
     HIDDEN_DIM = 512                             # Число скрытых признаков LSTM
     OUTPUT_DIM = len(RUSSIAN_ALPHABET)
     NUM_LAYERS = 4                               # Число слоев LSTM
-    DROPOUT = 0.25                               # Обрубание весов
+    DROPOUT = 0.3                                # Обрубание весов
     BATCH_SIZE = 16                              # Число обрабатываемых аудио за проход
     NUM_EPOCHS = 50                              # Число эпох обучения
-    LEARNING_RATE = 1e-4                         # Adam с большими моделями лучше сходится с меньшим LR
-    WEIGHT_DECAY = 1e-5                          # Небольшая L2 регуляризация
+    LEARNING_RATE = 5e-5                         # Adam с большими моделями лучше сходится с меньшим LR
+    WEIGHT_DECAY = 1e-4                          # Небольшая L2 регуляризация
     CLIP_GRAD_NORM = 5.0                         # Для предотвращения взрыва градиентов
     ANNOTATIONS_FILE = "./dataset_target.csv"    # Путь к CSV с метками датасета
     AUDIO_DIR = "F:/asr_public_phone_calls_1/0/" # Путь к папке с аудио
     MODEL_SAVE_PATH = "asr_ctc_model_best.pth"   # Путь сохранения модели
+    MODEL_PATH = "./asr_ctc_model_best_6epoch.pth"
     TRAIN_SPLIT_RATIO = 0.9                      # 90% на обучение, 10% на валидацию
-    PATIENCE_SCHEDULER = 2                       # для ReduceLROnPlateau
+    PATIENCE_SCHEDULER = 3                       # для ReduceLROnPlateau
     PATIENCE_EARLY_STOPPING = 7                  # остановка после N эпох без улучшений
-
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Используется устройство: {device}")
@@ -264,10 +364,10 @@ if __name__ == "__main__":
 
     # Инициализация модели
     model = ASR_CTC_Model(INPUT_DIM, HIDDEN_DIM, OUTPUT_DIM, NUM_LAYERS, DROPOUT).to(device)
-    print(model) # Вывод структуры модели
+    #print(model) # Вывод структуры модели
 
-    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)   
-    print(f"Общее количество обучаемых параметров: {total_params:,}")
+    #total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)   
+    #print(f"Общее количество обучаемых параметров: {total_params:,}")
 
 
     # Функция потерь CTC. blank=0 соответствует '_' в алфавите
@@ -430,41 +530,55 @@ if __name__ == "__main__":
 
     # Пример использования обученной модели 
     print("\nЗагрузка лучшей модели для предсказания...")
-    model.load_state_dict(torch.load(MODEL_SAVE_PATH, map_location=device))
+    model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
     model.eval()
 
-    transcribe_audio(model, "C:/Users/danya/Desktop/Record (online-voice-recorder.com).mp3")
+    wer_full_dataset = CustomAudioDataset(ANNOTATIONS_FILE, AUDIO_DIR, char_map)
+    
+    val_size = int(0.1*len(wer_full_dataset))
+    train_size = len(wer_full_dataset) - val_size
 
-    # Используем первые 100 файлов из датасета для примера
-    try:
-        for index in range(100):
-            example_idx_in_full = val_dataset.indices[index] # Индекс в валидационном датасете
-            #example_idx_in_full = train_dataset.indices[index] # Индекс в обучающем датасете
-            example_audio_filename = full_dataset.audio_target.iloc[example_idx_in_full, 0]
-            example_audio_path = os.path.join(AUDIO_DIR, example_audio_filename + ".opus") # или .wav
-            #print(f"Пример аудио для предсказания: {example_audio_path}")
+    all_indices = list(range(len(wer_full_dataset))) # Все индексы от 0 до N-1
+    val_indices = all_indices[train_size:]    
 
-            input_tensor = preprocess_audio(example_audio_path)
+    val_dataset = Subset(wer_full_dataset, val_indices)
 
-            if input_tensor is not None:
-                input_tensor = input_tensor.unsqueeze(0).to(device) # Добавляем batch измерение
+    val_dataloader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn_asr, num_workers=4, pin_memory=True if device == 'cuda' else False)
 
-                with torch.no_grad():
-                    output = model(input_tensor) # (1, T', output_dim)
-                    predicted_indices = torch.argmax(output, dim=2).squeeze(0).cpu().tolist()
-                    decoded_text = int_to_text(predicted_indices, index_map)
-                    print(f"\nПредсказание для {example_audio_path}:")
-                    print(f"  Декодированный текст (жадный поиск): '{decoded_text}'")
+    epoch_wer, _, _ = evaluate_wer(model, val_dataloader, device, index_map)
 
-                    # Получим реальный текст для сравнения
-                    real_text = full_dataset.audio_target.iloc[example_idx_in_full, 1]
-                    print(f"  Реальный текст: '{real_text.lower()}'")
-            else:
-                print(f"Не удалось обработать пример аудио: {example_audio_path}")
-        print(1)
-    except IndexError:
-        print("Не удалось получить пример из валидационного датасета.")
-    except FileNotFoundError:
-         print(f"Пример аудиофайла не найден: {example_audio_path}")
+    #transcribe_audio(model, "C:/Users/danya/Desktop/Record (online-voice-recorder.com).mp3")
+
+    # # Используем первые 100 файлов из датасета для примера
+    # try:
+    #     for index in range(100):
+    #         example_idx_in_full = val_dataset.indices[index] # Индекс в валидационном датасете
+    #         #example_idx_in_full = train_dataset.indices[index] # Индекс в обучающем датасете
+    #         example_audio_filename = full_dataset.audio_target.iloc[example_idx_in_full, 0]
+    #         example_audio_path = os.path.join(AUDIO_DIR, example_audio_filename + ".opus") # или .wav
+    #         #print(f"Пример аудио для предсказания: {example_audio_path}")
+
+    #         input_tensor = preprocess_audio(example_audio_path)
+
+    #         if input_tensor is not None:
+    #             input_tensor = input_tensor.unsqueeze(0).to(device) # Добавляем batch измерение
+
+    #             with torch.no_grad():
+    #                 output = model(input_tensor) # (1, T', output_dim)
+    #                 predicted_indices = torch.argmax(output, dim=2).squeeze(0).cpu().tolist()
+    #                 decoded_text = int_to_text(predicted_indices, index_map)
+    #                 print(f"\nПредсказание для {example_audio_path}:")
+    #                 print(f"  Декодированный текст (жадный поиск): '{decoded_text}'")
+
+    #                 # Получим реальный текст для сравнения
+    #                 real_text = full_dataset.audio_target.iloc[example_idx_in_full, 1]
+    #                 print(f"  Реальный текст: '{real_text.lower()}'")
+    #         else:
+    #             print(f"Не удалось обработать пример аудио: {example_audio_path}")
+    #     print(1)
+    # except IndexError:
+    #     print("Не удалось получить пример из валидационного датасета.")
+    # except FileNotFoundError:
+    #      print(f"Пример аудиофайла не найден: {example_audio_path}")
 
     # можно добавить Beam Search декодирование с использованием внешних библиотек pyctcdecode, для лучших результатов.
