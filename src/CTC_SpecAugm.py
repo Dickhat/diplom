@@ -386,23 +386,19 @@ def evaluate_wer(model: nn.Module,
 
 
 if __name__ == "__main__":
-    SUBSET_FRACTION = 0.001
-
     # Гиперпараметры
     INPUT_DIM = 80                                          # n_mels число уровней мэл
-    HIDDEN_DIM = 512                                        # Число скрытых признаков LSTM
+    HIDDEN_DIM = 768                                       # Число скрытых признаков LSTM
     OUTPUT_DIM = len(RUSSIAN_ALPHABET)
     NUM_LAYERS = 4                                          # Число слоев LSTM
     DROPOUT = 0.3                                           # Обрубание весов
-    BATCH_SIZE = 16                                         # Число обрабатываемых аудио за проход
-    NUM_EPOCHS = 50                                         # Число эпох обучения
-    LEARNING_RATE = 5e-5                                    # Adam с большими моделями лучше сходится с меньшим LR
+    BATCH_SIZE = 64                                         # Число обрабатываемых аудио за проход
+    NUM_EPOCHS = 5                                         # Число эпох обучения
+    LEARNING_RATE = 1e-4                                    # Adam с большими моделями лучше сходится с меньшим LR
     WEIGHT_DECAY = 1e-4                                     # Небольшая L2 регуляризация
     CLIP_GRAD_NORM = 5.0                                    # Для предотвращения взрыва градиентов
-    ANNOTATIONS_FILE = "./dataset_target.csv"               # Путь к CSV с метками датасета
-    AUDIO_DIR = "F:/asr_public_phone_calls_1/0/"            # Путь к папке с аудио
-    MODEL_SAVE_PATH = "asr_ctc_model_best_v3_aug_log.pth"   # Путь сохранения модели
-    MODEL_PATH = "./asr_ctc_model_best_6epoch.pth"          # Путь для дообучения модели
+    MODEL_SAVE_PATH = "/kaggle/working/asr_ctc_model_best_v3_aug_log.pth"   # Путь сохранения модели
+    model_load_path = ""                                    # Путь для дообучения модели
     TRAIN_SPLIT_RATIO = 0.9                                 # 90% на обучение, 10% на валидацию
     PATIENCE_SCHEDULER = 3                                  # для ReduceLROnPlateau
     PATIENCE_EARLY_STOPPING = 10                            # Число эпох без улучшения для выхода
@@ -410,8 +406,8 @@ if __name__ == "__main__":
     TIME_MASK_PARAM = 70                                    # Аугментация по времени
 
     data_sources = [
-        ("F:/asr_public_phone_calls_1/dataset_target.csv", "F:/asr_public_phone_calls_1/0/"),
-        ("F:/golos/dataset_target.csv", "F:/golos/0/")
+        ("/kaggle/input/audiosets/dataset_target.csv", "/kaggle/input/audiosets/asr_public_phone_calls_1/asr_public_phone_calls_1/0"),
+        ("/kaggle/input/russian-asr-golos/golos/golos/dataset_target.csv", "/kaggle/input/russian-asr-golos/golos/0")
         ]
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -427,9 +423,7 @@ if __name__ == "__main__":
     print("Создание датасетов...")
 
     all_datasets_train_version = [
-            SingleSourceAudioDataset(csv, adir, char_map, apply_augmentation=True,
-                                    freq_mask_param=FREQ_MASK_PARAM,
-                                    time_mask_param=TIME_MASK_PARAM)
+            SingleSourceAudioDataset(csv, adir, char_map, apply_augmentation=False)
             for csv, adir in data_sources
         ]
 
@@ -468,11 +462,10 @@ if __name__ == "__main__":
     # Инициализация модели
     model = ASR_CTC_Model(INPUT_DIM, HIDDEN_DIM, OUTPUT_DIM, NUM_LAYERS, DROPOUT).to(device)
 
-    # Загрузка весов, если нужно продолжить обучение
-    # model_load_path = "путь/к/предыдущей/модели.pth"
-    # if os.path.exists(model_load_path):
-    #     print(f"Загрузка весов из {model_load_path}")
-    #     model.load_state_dict(torch.load(model_load_path, map_location=device))
+    # # Загрузка весов, если нужно продолжить обучение
+    if os.path.exists(model_load_path):
+        print(f"Загрузка весов из {model_load_path}")
+        model.load_state_dict(torch.load(model_load_path, map_location=device))
 
     print(model)
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -615,8 +608,9 @@ if __name__ == "__main__":
         scheduler.step(epoch_wer)
 
         if epoch_wer < best_val_wer:
+            cur_epoch = epoch
             best_val_wer = epoch_wer
-            torch.save(model.state_dict(), MODEL_SAVE_PATH)
+            torch.save(model.state_dict(), f"/kaggle/working/asr_ctc_model_epoch{cur_epoch}_WER.pth")
             print(f"  Validation WER улучшился до {best_val_wer:.2f}%. Модель сохранена.")
             epochs_no_improve = 0
         else:
