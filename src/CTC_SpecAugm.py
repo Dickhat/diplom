@@ -3,6 +3,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torchviz import make_dot
 from torch.utils.data import Dataset, DataLoader, Subset, ConcatDataset, random_split
 from torch.nn.utils.rnn import pad_sequence
 import librosa
@@ -406,8 +407,7 @@ if __name__ == "__main__":
     TIME_MASK_PARAM = 70                                    # Аугментация по времени
 
     data_sources = [
-        ("/kaggle/input/audiosets/dataset_target.csv", "/kaggle/input/audiosets/asr_public_phone_calls_1/asr_public_phone_calls_1/0"),
-        ("/kaggle/input/russian-asr-golos/golos/golos/dataset_target.csv", "/kaggle/input/russian-asr-golos/golos/0")
+        ("C:/Users/danya/Desktop/diplom/dataset_target.csv", "C:/Users/danya/Desktop/diplom/temp/"),
         ]
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -508,11 +508,15 @@ if __name__ == "__main__":
             input_lengths = input_lengths_T.to(device, non_blocking=True)
             target_lengths = target_lengths.to(device, non_blocking=True)
 
+            outputs = model(inputs) # (B, T_out, C)
+            make_dot(outputs, params=dict(model.named_parameters())).render("model_architecture", format="png")
+
             optimizer.zero_grad()
 
             try:
                 outputs = model(inputs) # (B, T_out, C)
                 output_lengths = model.get_output_lengths(input_lengths).to(device) # (B)
+                
 
                 # Проверка валидности длин
                 valid_indices = output_lengths >= target_lengths
