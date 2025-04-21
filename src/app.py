@@ -12,6 +12,7 @@ import time
 import torch
 import torch.nn as nn
 import librosa
+from transformers import WhisperFeatureExtractor, WhisperForConditionalGeneration, WhisperTokenizer, WhisperProcessor, WhisperForConditionalGeneration
 
 # КОНСТАНТЫ И ФУНКЦИИ МОДЕЛИ 
 RUSSIAN_ALPHABET = "_абвгдеёжзийклмнопрстуфхцчшщъыьэюя "
@@ -218,19 +219,24 @@ def transcribe_chunk(audio_chunk, model, device, index_map):
         print(f"Ошибка во время инференса модели: {e}")
         return "[Ошибка инференса]"
 
+QUEUE_END_MARKER = object()
+
 # Класс GUI приложения
 class AudioApp:
-    def __init__(self, root, loaded_model):
+    def __init__(self, root, loaded_model, feauture_extractor, model, tokenizer):
         self.root = root
         self.root.title("Автоматическая транскрибация речи")
-        self.model = loaded_model # Модель
+        self.model = loaded_model # Модель для моей
+        self.whisper_feature_extractor = feauture_extractor
+        self.whisper_model = model
+        self.whisper_tokenizer = tokenizer
         self.device = device      # CPU или GPU
 
         #  Параметры записи
         self.samplerate = 16000
         self.channels = 1
         self.blocksize = 1024 # Размер блока от sounddevice
-        self.seconds_per_chunk = 1 # Сколько секунд накапливать для транскрибации
+        self.seconds_per_chunk = 5 # Сколько секунд накапливать для транскрибации
         self.samples_per_chunk = self.samplerate * self.seconds_per_chunk
 
         # GUI элементы
@@ -266,16 +272,15 @@ class AudioApp:
 
         # Очередь и буфер
         self.audio_queue = queue.Queue()
+        self.transcription_queue = queue.Queue()
         self.internal_buffer = [] # Накапливаем здесь до нужного размера
 
         # Состояние
         self.recording_thread = None
         self.processing_thread = None
-        self.is_running = False                     # Флаг для основного потока записи
-        self.stop_processing = threading.Event()    # Событие для остановки потока обработки
-
-        # Запускаем поток для обработки аудио из очереди
-        self.start_processing_thread()
+        self.is_recording = False                   # Флаг для основного потока записи
+        self.gui_update_timer = None                # Для таймера обновления GUI
+        self.gui_update_ms = 100                    # Как часто проверять очередь текста (мс)
 
     def choose_directory(self):
         folder = filedialog.askdirectory()
@@ -285,8 +290,8 @@ class AudioApp:
 
     def audio_callback(self, indata: np.ndarray, frames: int, time, status: sd.CallbackFlags):
         """Callback функция от sounddevice."""
-        if status: 
-            print(status, flush=True) # Выводим статус, если есть
+        if status: print(status, flush=True) # Выводим статус, если есть
+        if not self.is_recording: return
 
         # Копируем данные и добавляем в буфер и берем только первый канал
         self.internal_buffer.append(indata[:, 0].copy())
@@ -313,22 +318,26 @@ class AudioApp:
                 self.internal_buffer = []
 
     def toggle_recording(self):
-        if not self.is_running:
+        if not self.is_recording:
             self.start_recording()
         else: 
             self.stop_recording()
 
     def start_recording(self):
-        if self.is_running:
+        if self.is_recording:
             return # Уже запущено
         
         print("Запуск записи...")
 
-        self.is_running = True
+        self.is_recording = True
         self.internal_buffer = [] # Очищаем буфер
         self.record_button.config(text="Остановить запись")
         self.recording_indicator.config(text="● Идёт запись...")
         self.clear_transcription() # Очищаем текстовое поле
+
+        # Запускаем поток для обработки аудио из очереди
+        self.start_processing_thread()
+        self.start_gui_updater() # Запускаем обновление GUI
 
         # Функция для выполнения в потоке записи
         def _record_thread():
@@ -339,7 +348,7 @@ class AudioApp:
                                     channels=self.channels,
                                     blocksize=self.blocksize, # Размер блока для callback
                                     dtype='float32'): # Используем float32
-                    while self.is_running:
+                    while self.is_recording:
                         sd.sleep(100) # Небольшая пауза, чтобы не грузить CPU
                 print("Поток записи завершен.")
             except Exception as e:
@@ -351,23 +360,48 @@ class AudioApp:
         self.recording_thread.start()
 
     def stop_recording(self):
-        if not self.is_running: return # Уже остановлено
+        if not self.is_recording: return # Уже остановлено
+        
         print("Остановка записи...")
-        self.is_running = False # Сигнализируем потоку записи остановиться
+        self.is_recording = False # Сигнализируем потоку записи остановиться
 
         # Ждем завершения потока записи (с таймаутом)
         if self.recording_thread is not None:
-             self.recording_thread.join(timeout=1.0) # Ждем не более 1 секунды
-             if self.recording_thread.is_alive():
-                 print("Предупреждение: Поток записи не завершился вовремя.")
-             self.recording_thread = None
+            print("Ожидание завершения потока записи...")
+            self.recording_thread.join(timeout=1.0) # Ждем не более 1 секунд
+            if self.recording_thread.is_alive():
+                print("Предупреждение: Поток записи не завершился вовремя.")
+            self.recording_thread = None
+
+        # Проверка, что буфер пуст
+        if self.internal_buffer:
+            # Объединяем все, что осталось
+            final_chunk = np.concatenate(self.internal_buffer, axis=0)
+            if final_chunk.size > 0: # Только если что-то есть
+                self.audio_queue.put(final_chunk) # Кладем последний кусок в очередь
+
+            self.internal_buffer = [] # Очищаем буфер
+
+        self.audio_queue.put(QUEUE_END_MARKER)
+
+        # Ждем завершения потока обработки (он должен доопработать очередь)
+        if self.processing_thread is not None:
+            print("Ожидание завершения потока обработки...")
+            self.audio_queue.join() # Даем БОЛЬШЕ времени на дообработку
+            self.processing_thread.join()
+            self.processing_thread = None
+        print("Поток обработки остановлен.")
+
+        self.stop_gui_updater()
+
+        self.check_transcription_queue(run_once=True)
+        self.root.update_idletasks()
 
         self.save_transcription()
 
         self.record_button.config(text="Начать запись")
         self.recording_indicator.config(text="")
         print("Запись остановлена.")
-        # Можно добавить обработку оставшихся данных в internal_buffer, если нужно
 
     def save_transcription(self):
         """Сохраняет весь текст из текстового поля в файл."""
@@ -395,38 +429,82 @@ class AudioApp:
 
     def start_processing_thread(self):
         """Запускает поток обработки очереди."""
-        self.stop_processing.clear() # Сбрасываем флаг остановки
         self.processing_thread = threading.Thread(target=self.process_audio_from_queue, daemon=True)
         self.processing_thread.start()
 
     def process_audio_from_queue(self):
         """Поток, который берет чанки из очереди и транскрибирует их."""
         print("Поток обработки очереди запущен.")
-        while not self.stop_processing.is_set():
+
+        forced_decoder_ids = self.whisper_tokenizer.get_decoder_prompt_ids(language="ru", task="transcribe")
+        transcribed_text = ""
+        while True:
             try:
                 # Ждем данные из очереди (с таймаутом, чтобы можно было подождать данные)
                 audio_chunk = self.audio_queue.get(timeout=0.5) # Таймаут 0.5 сек
 
-                # Транскрибация
+                if audio_chunk is QUEUE_END_MARKER:
+                    print("Поток обработки: получен маркер конца.")
+                    self.audio_queue.task_done()
+                    break
+
+                rms = np.sqrt(np.mean(audio_chunk**2))  # Корень из среднего квадрата — RMS
+                db = 20 * np.log10(rms + 1e-9)          # Преобразуем в dB, добавляем ε чтобы не делить на 0
+
+                if db < -50:  
+                    self.audio_queue.task_done()
+                    print("Тишина, пропускаем...")
+                    print(f"db {db}")
+                    continue
+                
+                print(f"Не шум db {db}")
+
+                feature = self.whisper_feature_extractor(audio_chunk, sampling_rate=16000, language="ru", return_tensors="pt").input_features
+                feature = feature.to(self.device)
+
+                generated_tokens =self.whisper_model.generate(input_features=feature, forced_decoder_ids=forced_decoder_ids)
+                
+                transcribed_text = self.whisper_tokenizer.batch_decode(generated_tokens.cpu(), skip_special_tokens=True)[0]
+
+                # Транскрибация моей моделью
                 #start_time = time.time()
-                transcribed_text = transcribe_chunk(audio_chunk, self.model, self.device, index_map)
+                #transcribed_text = transcribe_chunk(audio_chunk, self.model, self.device, index_map)
                 #end_time = time.time()
                 # print(f"Транскрибация чанка ({end_time - start_time:.2f} сек): '{transcribed_text}'")
 
                 # Обновление GUI
                 if transcribed_text and transcribed_text not in ["[Ошибка обработки]", "[Ошибка инференса]", "[Модель не загружена]"]:
-                    # Добавляем текст в поле с прокруткой через 0 секунд
-                    self.root.after(0, self.update_transcription, transcribed_text + " ") # Добавляем пробел
+                    self.transcription_queue.put(transcribed_text + " ")
 
-            except queue.Empty:
-                # Очередь пуста, просто продолжаем ждать
-                continue
+                self.audio_queue.task_done()
             except Exception as e:
-                print(f"Ошибка в потоке обработки: {e}")
-                time.sleep(0.4) # Небольшая пауза при ошибке
+                print(f" Очередь пустая: {e}")
+                time.sleep(0.1) # Небольшая пауза при ошибке    
+        
+        try: 
+            self.audio_queue.task_done() # Пытаемся пометить задачу как выполненную
+        except ValueError: 
+            pass
         print("Поток обработки очереди остановлен.")
 
-    def update_transcription(self, text_to_add):
+    # обновления GUI из очереди
+    def check_transcription_queue(self, run_once=False):
+        """Проверяет очередь текста и обновляет виджет."""
+        try:
+            while True: # Обрабатываем все сообщения в очереди
+                text_to_add = self.transcription_queue.get_nowait()
+                self.update_transcription_widget(text_to_add)
+        except queue.Empty:
+            pass # Очередь пуста
+        except Exception as e:
+            print(f"Ошибка обновления GUI из очереди: {e}")
+        finally:
+            # Планируем следующую проверку, только если не запрошен однократный запуск
+            # и если окно еще существует
+            if not run_once and self.root.winfo_exists():
+                self.gui_update_timer = self.root.after(self.gui_update_ms, self.check_transcription_queue)
+
+    def update_transcription_widget(self, text_to_add):
         """Безопасно обновляет текстовое поле из главного потока."""
         self.transcription_text.config(state=tk.NORMAL) # Разрешаем редактирование
         self.transcription_text.insert(tk.END, text_to_add)
@@ -439,23 +517,50 @@ class AudioApp:
         self.transcription_text.delete('1.0', tk.END)
         self.transcription_text.config(state=tk.DISABLED)
 
+    # управление таймером обновления GUI 
+    def start_gui_updater(self):
+        """Запускает периодическую проверку очереди текста."""
+        self.stop_gui_updater()             # Останавливаем предыдущий таймер, если был
+        self.check_transcription_queue()    # Запускаем первый раз
+
+    def stop_gui_updater(self):
+        """Останавливает периодическую проверку очереди текста."""
+        if self.gui_update_timer is not None:
+            self.root.after_cancel(self.gui_update_timer)
+            self.gui_update_timer = None
+
     def on_closing(self):
         """Обработка закрытия окна."""
         print("Закрытие приложения...")
-        if self.is_running:
+        if self.is_recording:
             self.stop_recording() # Останавливаем запись, если идет
-        self.stop_processing.set() # Сигнализируем потоку обработки остановиться
-        if self.processing_thread is not None:
-            self.processing_thread.join(timeout=1.0) # Ждем поток обработки
-        self.root.destroy() # Закрываем окно
+        else:
+            if self.processing_thread is not None and self.processing_thread.is_alive():
+                print("Отправка маркера конца при закрытии...")
+                self.audio_queue.put(QUEUE_END_MARKER)
+                # Не ждем здесь долго, просто даем шанс завершиться
+                self.processing_thread.join(timeout=1.0)
+        
+        self.stop_gui_updater() # Останавливаем таймер GUI
+        self.root.destroy()     # Закрытие окна
 
-
-# --- Запуск приложения ---
 if __name__ == "__main__":
-    if model is None:
-        print("Модель не была загружена. Запустите скрипт заново, указав правильный путь.")
-    else:
-        root = tk.Tk()
-        app = AudioApp(root, model) # Передаем загруженную модель в приложение
-        root.protocol("WM_DELETE_WINDOW", app.on_closing) # Обработка закрытия окна
-        root.mainloop()
+    # tiny
+    # feauture_extractor = WhisperFeatureExtractor.from_pretrained("models--openai--whisper-tiny/snapshots/169d4a4341b33bc18d8881c4b69c2e104e1cc0af")
+    # whisper_model = WhisperForConditionalGeneration.from_pretrained("models--openai--whisper-tiny/snapshots/169d4a4341b33bc18d8881c4b69c2e104e1cc0af")
+    # tokenizer = WhisperTokenizer.from_pretrained("models--openai--whisper-tiny/snapshots/169d4a4341b33bc18d8881c4b69c2e104e1cc0af", language = "russian", task="transcribe")
+
+    # openai/whisper-large-v3-turbo
+    feauture_extractor = WhisperFeatureExtractor.from_pretrained("models--openai--whisper-large-v3-turbo/snapshots/41f01f3fe87f28c78e2fbf8b568835947dd65ed9")
+    whisper_model = WhisperForConditionalGeneration.from_pretrained("models--openai--whisper-large-v3-turbo/snapshots/41f01f3fe87f28c78e2fbf8b568835947dd65ed9")
+    tokenizer = WhisperTokenizer.from_pretrained("models--openai--whisper-large-v3-turbo/snapshots/41f01f3fe87f28c78e2fbf8b568835947dd65ed9", language = "russian", task="transcribe")
+    
+    whisper_model.to(device)
+
+    #if model is None:
+    #    print("Модель не была загружена. Запустите скрипт заново, указав правильный путь.")
+    #else:
+    root = tk.Tk()
+    app = AudioApp(root, model, feauture_extractor, whisper_model, tokenizer) # Передаем загруженную модель в приложение
+    root.protocol("WM_DELETE_WINDOW", app.on_closing) # Обработка закрытия окна
+    root.mainloop()
