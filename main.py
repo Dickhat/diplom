@@ -176,9 +176,9 @@ def extract_features(audio_path, sample_rate=16000, print_fig = False):
 
 #text = transcribe("F:/asr_public_phone_calls_1/0/4bc84bbfa234.opus")
 
-feauture_extractor = WhisperFeatureExtractor.from_pretrained("openai/whisper-large-v3-turbo")
-model = WhisperForConditionalGeneration.from_pretrained("openai/whisper-large-v3-turbo")
-tokenizer = WhisperTokenizer.from_pretrained("openai/whisper-large-v3-turbo", language = "russian")
+feauture_extractor = WhisperFeatureExtractor.from_pretrained("openai/whisper-tiny")
+model = WhisperForConditionalGeneration.from_pretrained("openai/whisper-tiny")
+tokenizer = WhisperTokenizer.from_pretrained("openai/whisper-tiny", language = "russian")
 
 waveform, orig_sr = librosa.load("F:/asr_public_phone_calls_1/0/4bc84bbfa234.opus", sr=16000, mono=True)
 

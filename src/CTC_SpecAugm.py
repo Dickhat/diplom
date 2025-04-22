@@ -3,7 +3,8 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader, Subset # Убрали random_split, т.к. делаем вручную
+from torchviz import make_dot
+from torch.utils.data import Dataset, DataLoader, Subset, ConcatDataset, random_split
 from torch.nn.utils.rnn import pad_sequence
 import librosa
 import numpy as np
@@ -166,6 +167,65 @@ class ASR_CTC_Model(nn.Module):
         # Итого T_out = T_in / 4
         return lengths
 
+
+class SingleSourceAudioDataset(Dataset):
+    def __init__(self, annotation_file, audio_dir, char_map, apply_augmentation=False, freq_mask_param=27, time_mask_param=70):
+        """ Работает с ОДНИМ файлом аннотации и ОДНОЙ аудио директорией. """
+        self.audio_dir = audio_dir
+        self.char_map = char_map
+        self.apply_augmentation = apply_augmentation
+        self.spec_augment = None
+
+        try:
+            self.audio_target = pd.read_csv(annotation_file)
+            self.audio_target.dropna(subset=['text'], inplace=True)
+            self.audio_target = self.audio_target[self.audio_target['text'].apply(lambda x: isinstance(x, str))]
+            self.audio_target = self.audio_target[self.audio_target['text'].str.strip() != '']
+            self.audio_target.reset_index(drop=True, inplace=True) # Важно для Subset/ConcatDataset
+        except FileNotFoundError:
+            print(f"Ошибка: Файл аннотации не найден: {annotation_file}")
+            self.audio_target = pd.DataFrame(columns=['filename', 'text']) # Пустой
+        except Exception as e:
+            print(f"Ошибка при чтении {annotation_file}: {e}")
+            self.audio_target = pd.DataFrame(columns=['filename', 'text'])
+
+        if self.apply_augmentation and len(self.audio_target) > 0:
+            self.spec_augment = nn.Sequential(T.FrequencyMasking(freq_mask_param=freq_mask_param),T.TimeMasking(time_mask_param=time_mask_param)).eval()
+
+    def __len__(self):
+        return len(self.audio_target)
+
+    def __getitem__(self, idx):
+        if idx >= len(self.audio_target):
+            raise IndexError(f"Индекс {idx} за пределами датасета (размер {len(self.audio_target)})")
+        try:
+            row = self.audio_target.iloc[idx]
+            audio_filename_no_ext = row['filename']
+            label_text = row['text']
+
+            potential_path_opus = os.path.join(self.audio_dir, str(audio_filename_no_ext) + ".opus")
+            
+            if not os.path.exists(potential_path_opus): 
+                return None, None, None
+           
+            log_mel_spectrogram = preprocess_audio(potential_path_opus)
+            
+            if log_mel_spectrogram is None: 
+                return None, None, None
+            
+            if self.apply_augmentation and self.spec_augment is not None:
+                log_mel_spectrogram = self.spec_augment(log_mel_spectrogram)
+
+            if not isinstance(label_text, str): 
+                return None, None, None
+            
+            label_int = text_to_int(label_text, self.char_map) 
+            label_tensor = torch.tensor(label_int, dtype=torch.long)
+
+            return log_mel_spectrogram, label_tensor, label_text.lower()
+        except Exception as e: 
+            print(f"Ошибка в __getitem__ (idx={idx}): {e}"); return None, None, None
+
 # Dataset для АУГМЕНТАЦИИ и возврата текста
 class CustomAudioDataset(Dataset):
     def __init__(self, annotations_file, audio_dir, char_map, apply_augmentation=False, freq_mask_param=27, time_mask_param=70):
@@ -327,28 +387,28 @@ def evaluate_wer(model: nn.Module,
 
 
 if __name__ == "__main__":
-    SUBSET_FRACTION = 0.001
-
     # Гиперпараметры
     INPUT_DIM = 80                                          # n_mels число уровней мэл
-    HIDDEN_DIM = 512                                        # Число скрытых признаков LSTM
+    HIDDEN_DIM = 768                                       # Число скрытых признаков LSTM
     OUTPUT_DIM = len(RUSSIAN_ALPHABET)
     NUM_LAYERS = 4                                          # Число слоев LSTM
     DROPOUT = 0.3                                           # Обрубание весов
-    BATCH_SIZE = 16                                         # Число обрабатываемых аудио за проход
-    NUM_EPOCHS = 50                                         # Число эпох обучения
-    LEARNING_RATE = 5e-5                                    # Adam с большими моделями лучше сходится с меньшим LR
+    BATCH_SIZE = 64                                         # Число обрабатываемых аудио за проход
+    NUM_EPOCHS = 5                                         # Число эпох обучения
+    LEARNING_RATE = 1e-4                                    # Adam с большими моделями лучше сходится с меньшим LR
     WEIGHT_DECAY = 1e-4                                     # Небольшая L2 регуляризация
     CLIP_GRAD_NORM = 5.0                                    # Для предотвращения взрыва градиентов
-    ANNOTATIONS_FILE = "./dataset_target.csv"               # Путь к CSV с метками датасета
-    AUDIO_DIR = "F:/asr_public_phone_calls_1/0/"            # Путь к папке с аудио
-    MODEL_SAVE_PATH = "asr_ctc_model_best_v3_aug_log.pth"   # Путь сохранения модели
-    MODEL_PATH = "./asr_ctc_model_best_6epoch.pth"          # Путь для дообучения модели
+    MODEL_SAVE_PATH = "/kaggle/working/asr_ctc_model_best_v3_aug_log.pth"   # Путь сохранения модели
+    model_load_path = ""                                    # Путь для дообучения модели
     TRAIN_SPLIT_RATIO = 0.9                                 # 90% на обучение, 10% на валидацию
     PATIENCE_SCHEDULER = 3                                  # для ReduceLROnPlateau
     PATIENCE_EARLY_STOPPING = 10                            # Число эпох без улучшения для выхода
     FREQ_MASK_PARAM = 27                                    # Аугментация по частоте
     TIME_MASK_PARAM = 70                                    # Аугментация по времени
+
+    data_sources = [
+        ("C:/Users/danya/Desktop/diplom/dataset_target.csv", "C:/Users/danya/Desktop/diplom/temp/"),
+        ]
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Используется устройство: {device}")
@@ -361,49 +421,51 @@ if __name__ == "__main__":
 
     # Загрузка и разделение данных
     print("Создание датасетов...")
-    full_dataset_train_version = CustomAudioDataset(ANNOTATIONS_FILE, AUDIO_DIR, char_map, apply_augmentation=True, freq_mask_param=FREQ_MASK_PARAM, time_mask_param=TIME_MASK_PARAM)
-    full_dataset_val_version = CustomAudioDataset(ANNOTATIONS_FILE, AUDIO_DIR, char_map, apply_augmentation=False)
 
-    if len(full_dataset_train_version) == 0: exit()
+    all_datasets_train_version = [
+            SingleSourceAudioDataset(csv, adir, char_map, apply_augmentation=False)
+            for csv, adir in data_sources
+        ]
 
-    dataset_size = len(full_dataset_train_version)
+    all_datasets_val_version = [
+            SingleSourceAudioDataset(csv, adir, char_map, apply_augmentation=False)
+            for csv, adir in data_sources
+        ]
 
-    # УДАЛИТЬ для 0.01 датасета
-    # subset_size = int(dataset_size * SUBSET_FRACTION)
-    # subset_indices = list(range(subset_size)) # Берем первые N индексов
-    # sub_train_size = int(len(subset_indices) * TRAIN_SPLIT_RATIO)
-    # sub_val_size = len(subset_indices) - sub_train_size
-    # train_indices = subset_indices[:sub_train_size]
-    # val_indices = subset_indices[sub_train_size:]
-    # train_subset_aug = Subset(full_dataset_train_version, train_indices)
-    # val_subset_noaug = Subset(full_dataset_val_version, val_indices)
+    # Фильтруем пустые Datasets
+    all_datasets_train_version = [ds for ds in all_datasets_train_version if len(ds) > 0]
+    all_datasets_val_version = [ds for ds in all_datasets_val_version if len(ds) > 0]
+    
+    if not all_datasets_train_version: 
+        print("Ошибка: Нет валидных данных!")
+        exit()
+
+    combined_dataset_train_ver = ConcatDataset(all_datasets_train_version)
+    combined_dataset_val_ver = ConcatDataset(all_datasets_val_version)
+    dataset_size = len(combined_dataset_train_ver)
+    print(f"Общий размер объединенного датасета: {dataset_size}")
 
     train_size = int(TRAIN_SPLIT_RATIO * dataset_size)
     val_size = dataset_size - train_size
-    indices = list(range(dataset_size))
+    train_indices, val_indices = random_split(range(dataset_size), [train_size, val_size])
 
-    #Фиксированное разбиение
-    train_indices = indices[:train_size]
-    val_indices = indices[train_size:]
+    train_subset = Subset(combined_dataset_train_ver, train_indices) # Train subset с аугментацией
+    val_subset = Subset(combined_dataset_val_ver, val_indices)     # Val subset БЕЗ аугментации
 
-    train_subset_aug = Subset(full_dataset_train_version, train_indices)
-    val_subset_noaug = Subset(full_dataset_val_version, val_indices)
-
-    print(f"Размер обучающей выборки: {len(train_subset_aug)}")
-    print(f"Размер валидационной выборки: {len(val_subset_noaug)}")
+    print(f"Размер обучающей выборки: {len(train_subset)}")
+    print(f"Размер валидационной выборки: {len(val_subset)}")
 
     # DataLoaders
-    train_dataloader = DataLoader(train_subset_aug, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn_asr_wer, num_workers=4, pin_memory=True if device == 'cuda' else False, persistent_workers=True if torch.cuda.is_available() and 4 > 0 else False)
-    val_dataloader = DataLoader(val_subset_noaug, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn_asr_wer, num_workers=4, pin_memory=True if device == 'cuda' else False, persistent_workers=True if torch.cuda.is_available() and 4 > 0 else False)
+    train_dataloader = DataLoader(train_subset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn_asr_wer, num_workers=4, pin_memory=True if device.type == 'cuda' else False, persistent_workers=True if torch.cuda.is_available() and 4 > 0 else False)
+    val_dataloader = DataLoader(val_subset, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn_asr_wer, num_workers=4, pin_memory=True if device.type == 'cuda' else False, persistent_workers=True if torch.cuda.is_available() and 4 > 0 else False)
 
     # Инициализация модели
     model = ASR_CTC_Model(INPUT_DIM, HIDDEN_DIM, OUTPUT_DIM, NUM_LAYERS, DROPOUT).to(device)
 
-    # Загрузка весов, если нужно продолжить обучение
-    # model_load_path = "путь/к/предыдущей/модели.pth"
-    # if os.path.exists(model_load_path):
-    #     print(f"Загрузка весов из {model_load_path}")
-    #     model.load_state_dict(torch.load(model_load_path, map_location=device))
+    # # Загрузка весов, если нужно продолжить обучение
+    if os.path.exists(model_load_path):
+        print(f"Загрузка весов из {model_load_path}")
+        model.load_state_dict(torch.load(model_load_path, map_location=device))
 
     print(model)
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -446,11 +508,15 @@ if __name__ == "__main__":
             input_lengths = input_lengths_T.to(device, non_blocking=True)
             target_lengths = target_lengths.to(device, non_blocking=True)
 
+            outputs = model(inputs) # (B, T_out, C)
+            make_dot(outputs, params=dict(model.named_parameters())).render("model_architecture", format="png")
+
             optimizer.zero_grad()
 
             try:
                 outputs = model(inputs) # (B, T_out, C)
                 output_lengths = model.get_output_lengths(input_lengths).to(device) # (B)
+                
 
                 # Проверка валидности длин
                 valid_indices = output_lengths >= target_lengths
@@ -546,8 +612,9 @@ if __name__ == "__main__":
         scheduler.step(epoch_wer)
 
         if epoch_wer < best_val_wer:
+            cur_epoch = epoch
             best_val_wer = epoch_wer
-            torch.save(model.state_dict(), MODEL_SAVE_PATH)
+            torch.save(model.state_dict(), f"/kaggle/working/asr_ctc_model_epoch{cur_epoch}_WER.pth")
             print(f"  Validation WER улучшился до {best_val_wer:.2f}%. Модель сохранена.")
             epochs_no_improve = 0
         else:

@@ -1,3 +1,7 @@
 venv
 runs
 asr*
+temp
+dataset_target.csv
+transcription*
+models-*
