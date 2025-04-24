@@ -3,7 +3,6 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torchviz import make_dot
 from torch.utils.data import Dataset, DataLoader, Subset, ConcatDataset, random_split
 from torch.nn.utils.rnn import pad_sequence
 import librosa
@@ -31,13 +30,15 @@ def text_to_int(text, char_map):
     return [char_map[char] for char in text if char in char_map]
 
 def int_to_text(indices, index_map, blank_char=BLANK_CHAR):
+
     """Преобразует индексы обратно в текст, убирая CTC-пустые символы и повторы."""
 
     text = ""
     blank_idx = char_map.get(blank_char, -1)
     last_idx = -1
     for idx in indices:
-        if idx == last_idx: continue
+        if idx == last_idx: 
+            continue
         if idx == blank_idx:
             last_idx = idx
             continue
@@ -49,6 +50,7 @@ def int_to_text(indices, index_map, blank_char=BLANK_CHAR):
     return text
 
 # Улучшенная обработка аудио (возвращает F, T)
+
 def preprocess_audio(audio_path, sample_rate=16000, n_mels=80, n_fft=400, hop_length=160):
     """Загружает аудио, преобразует в лог-мел-спектрограмму и нормализует."""
 
@@ -68,7 +70,7 @@ def preprocess_audio(audio_path, sample_rate=16000, n_mels=80, n_fft=400, hop_le
     try:
         mel_spectrogram = librosa.feature.melspectrogram(y=audio, sr=sample_rate, n_fft=n_fft, hop_length=hop_length, n_mels=n_mels, fmax=8000)
     except Exception as e:
-         print(f"Ошибка при вычислении melspectrogram для {audio_path} (даже после паддинга): {e}")
+         print(f"Ошибка при вычислении melspectrogram для {audio_path}: {e}")
          return None    # Проверка на нулевую энергию (тишину), которая может дать -inf после power_to_db
     
     if np.max(mel_spectrogram) == 0:
@@ -97,7 +99,7 @@ class ASR_CTC_Model(nn.Module):
         super(ASR_CTC_Model, self).__init__()
         # Слои Conv2d ожидают вход (B, C, H, W) или (B, C, F, T)
         self.conv_layers = nn.Sequential(
-            # Вход: (B, 1, F=input_dim, T)
+            # Вход: (B, C=1, F=input_dim, T=time)
             nn.Conv2d(1, 32, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1)), # -> (B, 32, F/2, T/2)
             nn.ReLU(),
             nn.BatchNorm2d(32),
@@ -107,7 +109,7 @@ class ASR_CTC_Model(nn.Module):
         )
     
         # Расчет входной размерности для LSTM
-        lstm_input_dim = 32 * (input_dim // 4) # Каналы * (F уменьшается в 2 раза дважды (из-за stride[0]=2))
+        lstm_input_dim = 32 * (input_dim // 4) # Каналы * (F уменьшается в 2 раза дважды)
 
         # Dropout слой
         self.conv_dropout = nn.Dropout(dropout)
@@ -146,7 +148,6 @@ class ASR_CTC_Model(nn.Module):
         x = self.fc(x) # -> (B, T', Output)
 
         # Применяем LogSoftmax для CTC Loss
-        # CTC ожидает (T, N, C), где N=batch_size, T=длина посл., C=классы
         x = nn.functional.log_softmax(x, dim=2) # -> (B, T', Output)
         return x
 
@@ -283,13 +284,14 @@ class CustomAudioDataset(Dataset):
         if not isinstance(label_text, str):
              # print(f"Предупреждение: Некорректная метка '{label_text}' для файла {audio_filename}, пропускаем.")
              return None, None, None
+        
         label_int = text_to_int(label_text, self.char_map)
         label_tensor = torch.tensor(label_int, dtype=torch.long)
 
         # Возвращаем 3 элемента
         return log_mel_spectrogram, label_tensor, label_text.lower()
 
-# collate_fn для обработки формата (F, T) и 5 элементов
+# collate_fn для обработки формата (F, T) и преобразования в 5 элементов
 def collate_fn_asr_wer(batch):
     # Фильтруем None (кортежи из 3-х элементов)
     batch = [(spec, target_tensor, target_text)
@@ -298,26 +300,29 @@ def collate_fn_asr_wer(batch):
     if not batch:
         return None, None, None, None, None
 
-    inputs_feat_time, targets_tensor, targets_text = zip(*batch) # inputs в формате (F, T)
+    # batch = список кортежей [(s1, t1, tx1), (s2, t2, tx2)] -> Итератор (s1, s2), (t1, t2), (tx1, tx2)
+    inputs_feat_time, targets_tensor, targets_text = zip(*batch) # inputs в формате (F, T), остальные одномерные
 
     # Длины по ВРЕМЕННОЙ оси (T) - вторая размерность
     input_lengths = torch.tensor([x.shape[1] for x in inputs_feat_time], dtype=torch.long)
     target_lengths = torch.tensor([len(t) for t in targets_tensor], dtype=torch.long)
 
-    # Паддинг входов (спектрограмм) по временной оси T
+    # Паддинг входов (спектрограмм) по временной оси T, чтобы были одинаковой длины
     try:
         inputs_permuted = [x.permute(1, 0) for x in inputs_feat_time] # список (T, F)
         inputs_padded_permuted = pad_sequence(inputs_permuted, batch_first=True, padding_value=0.0) # (B, T_padded, F)
         inputs_padded = inputs_padded_permuted.permute(0, 2, 1) # (B, F, T_padded)
     except Exception as e:
         print(f"Ошибка паддинга в collate_fn: {e}")
-        # Попытка вывести размеры для отладки
-        for i, spec in enumerate(inputs_feat_time):
-            print(f"  Элемент {i} форма: {spec.shape}")
         return None, None, None, None, None # Пропускаем батч при ошибке
 
     targets_concatenated = torch.cat(targets_tensor)
 
+    # inputs_padded - Спектрограммы (одинакого размера),
+    # targets_concatenated - целевой результат,
+    # input_lengths - исходная длина спектрограмм,
+    # target_lengths - исходная длина целевого результата,
+    # list(targets_text) - целевой текст
     return inputs_padded, targets_concatenated, input_lengths, target_lengths, list(targets_text)
 
 # Расчет WER
@@ -334,7 +339,8 @@ def evaluate_wer(model: nn.Module,
     print(f"\nНачало оценки WER на устройстве {device}...")
 
     for batch_data in tqdm(dataloader, desc="WER Evaluation"):
-        if batch_data is None or batch_data[0] is None: continue
+        if batch_data is None or batch_data[0] is None: 
+            continue
         try:
             inputs, _, input_lengths_T, _, ref_texts = batch_data # Длины по оси T
         except ValueError as e:
@@ -351,7 +357,7 @@ def evaluate_wer(model: nn.Module,
         except Exception as e:
             print(f"Ошибка model forward/get_output_lengths в evaluate_wer: {e}")
             # Попытка вывести размеры для отладки
-            print(f"  Форма inputs: {inputs.shape}, Длины входа T: {input_lengths_T_dev}")
+            print(f"Форма inputs: {inputs.shape}, Длины входа T: {input_lengths_T_dev}")
             continue
 
         preds_indices = torch.argmax(outputs, dim=2) # (B, T_out)
@@ -382,39 +388,42 @@ def evaluate_wer(model: nn.Module,
     else:
         print("Предупреждение: Не удалось собрать данные для расчета WER.")
 
-    # model.train() # Убрали, пусть вызывающий код решает, когда переключать режим
     return calculated_wer, all_references, all_predictions
 
 
 if __name__ == "__main__":
     # Гиперпараметры
-    INPUT_DIM = 80                                          # n_mels число уровней мэл
-    HIDDEN_DIM = 768                                       # Число скрытых признаков LSTM
-    OUTPUT_DIM = len(RUSSIAN_ALPHABET)
-    NUM_LAYERS = 4                                          # Число слоев LSTM
+    INPUT_DIM = 80                                          # n_mels число уровней мэл спектрограммы
+    HIDDEN_DIM = 1024                                       # Число скрытых признаков LSTM
+    OUTPUT_DIM = len(RUSSIAN_ALPHABET)                      # Алфавит
+    NUM_LAYERS = 7                                          # Число слоев LSTM
     DROPOUT = 0.3                                           # Обрубание весов
     BATCH_SIZE = 64                                         # Число обрабатываемых аудио за проход
-    NUM_EPOCHS = 5                                         # Число эпох обучения
-    LEARNING_RATE = 1e-4                                    # Adam с большими моделями лучше сходится с меньшим LR
+    NUM_EPOCHS = 50                                         # Число эпох обучения
+    LEARNING_RATE = 4e-4                                    # Adam с большими моделями лучше сходится с меньшим LR
     WEIGHT_DECAY = 1e-4                                     # Небольшая L2 регуляризация
     CLIP_GRAD_NORM = 5.0                                    # Для предотвращения взрыва градиентов
-    MODEL_SAVE_PATH = "/kaggle/working/asr_ctc_model_best_v3_aug_log.pth"   # Путь сохранения модели
-    model_load_path = ""                                    # Путь для дообучения модели
+    MODEL_SAVE_PATH = ""                                    # Путь сохранения модели
+    MODEL_PATH = ""                                         # Путь для дообучения модели
     TRAIN_SPLIT_RATIO = 0.9                                 # 90% на обучение, 10% на валидацию
     PATIENCE_SCHEDULER = 3                                  # для ReduceLROnPlateau
-    PATIENCE_EARLY_STOPPING = 10                            # Число эпох без улучшения для выхода
+    PATIENCE_EARLY_STOPPING = 15                            # Число эпох без улучшения для выхода
     FREQ_MASK_PARAM = 27                                    # Аугментация по частоте
     TIME_MASK_PARAM = 70                                    # Аугментация по времени
 
     data_sources = [
-        ("C:/Users/danya/Desktop/diplom/dataset_target.csv", "C:/Users/danya/Desktop/diplom/temp/"),
+        ("/kaggle/input/audiosets/dataset_target.csv", "/kaggle/input/audiosets/asr_public_phone_calls_1/asr_public_phone_calls_1/0"),
+        ("/kaggle/input/russian-asr-golos/golos/golos/dataset_target.csv", "/kaggle/input/russian-asr-golos/golos/0")
         ]
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Используется устройство: {device}")
 
+    if not os.path.exists("./models"):
+        os.makedirs("./models")
+
     # Инициализация TensorBoard
-    run_name = f"asr_lr{LEARNING_RATE}_wd{WEIGHT_DECAY}_dr{DROPOUT}_aug"
+    run_name = f"asr_layer{NUM_LAYERS}_neurons{HIDDEN_DIM}_lr{LEARNING_RATE}_wd{WEIGHT_DECAY}_dr{DROPOUT}"
     log_dir = os.path.join("runs", run_name)
     writer = SummaryWriter(log_dir)
     print(f"Логи TensorBoard: {log_dir}")
@@ -449,8 +458,8 @@ if __name__ == "__main__":
     val_size = dataset_size - train_size
     train_indices, val_indices = random_split(range(dataset_size), [train_size, val_size])
 
-    train_subset = Subset(combined_dataset_train_ver, train_indices) # Train subset с аугментацией
-    val_subset = Subset(combined_dataset_val_ver, val_indices)     # Val subset БЕЗ аугментации
+    train_subset = Subset(combined_dataset_train_ver, train_indices)    # Train БЕЗ аугментации
+    val_subset = Subset(combined_dataset_val_ver, val_indices)          # Val БЕЗ аугментации
 
     print(f"Размер обучающей выборки: {len(train_subset)}")
     print(f"Размер валидационной выборки: {len(val_subset)}")
@@ -462,10 +471,10 @@ if __name__ == "__main__":
     # Инициализация модели
     model = ASR_CTC_Model(INPUT_DIM, HIDDEN_DIM, OUTPUT_DIM, NUM_LAYERS, DROPOUT).to(device)
 
-    # # Загрузка весов, если нужно продолжить обучение
-    if os.path.exists(model_load_path):
-        print(f"Загрузка весов из {model_load_path}")
-        model.load_state_dict(torch.load(model_load_path, map_location=device))
+    # Загрузка весов, если нужно продолжить обучение
+    if os.path.exists(MODEL_PATH):
+        print(f"Загрузка весов из {MODEL_PATH}")
+        model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
 
     print(model)
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -474,7 +483,7 @@ if __name__ == "__main__":
     # Loss, Optimizer, Scheduler
     ctc_loss = nn.CTCLoss(blank=char_map[BLANK_CHAR], reduction='mean', zero_infinity=True).to(device)
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=PATIENCE_SCHEDULER, verbose=True) # mode='min' для WER
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=PATIENCE_SCHEDULER) # mode='min' для WER
 
     # Цикл обучения
     best_val_wer = float('inf')
@@ -484,13 +493,15 @@ if __name__ == "__main__":
     print(f"\n Начало обучения ({NUM_EPOCHS} эпох) ")
     for epoch in range(start_epoch, NUM_EPOCHS):
         start_time_epoch = time.time()
+
         # Обучение 
         model.train()
         train_loss_accum = 0.0
         processed_samples_train = 0
 
         for batch_idx, batch_data in enumerate(tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS} Training")):
-            if batch_data is None or batch_data[0] is None: continue
+            if batch_data is None or batch_data[0] is None:
+                continue
 
             try:
                 inputs, targets_concat, input_lengths_T, target_lengths, _ = batch_data
@@ -500,7 +511,6 @@ if __name__ == "__main__":
 
             # Проверка на пустые тензоры после фильтрации в collate
             if inputs.numel() == 0 or targets_concat.numel() == 0:
-                 # print(f"\nПропущен пустой батч {batch_idx+1} после collate.")
                  continue
 
             inputs = inputs.to(device, non_blocking=True)
@@ -508,17 +518,13 @@ if __name__ == "__main__":
             input_lengths = input_lengths_T.to(device, non_blocking=True)
             target_lengths = target_lengths.to(device, non_blocking=True)
 
-            outputs = model(inputs) # (B, T_out, C)
-            make_dot(outputs, params=dict(model.named_parameters())).render("model_architecture", format="png")
-
             optimizer.zero_grad()
 
             try:
                 outputs = model(inputs) # (B, T_out, C)
                 output_lengths = model.get_output_lengths(input_lengths).to(device) # (B)
-                
 
-                # Проверка валидности длин
+                # Проверка валидности длин полученной и целевой
                 valid_indices = output_lengths >= target_lengths
                 valid_indices &= (output_lengths > 0) & (target_lengths > 0)
 
@@ -528,14 +534,14 @@ if __name__ == "__main__":
 
                 # Фильтруем батч для лосса, если не все валидны
                 if not valid_indices.all():
-                    # print(f"\nФильтрация батча {batch_idx+1} для лосса...")
-                    outputs = outputs[valid_indices]
+                    outputs = outputs[valid_indices]            # Выбор только валидных элементов
                     targets_list = []
                     current_pos = 0
                     valid_target_lengths_list = []
-                    target_lengths_cpu = target_lengths.cpu() # Для итерации
-                    targets_cpu = targets.cpu() # Для срезов
+                    target_lengths_cpu = target_lengths.cpu()   # Для итерации
+                    targets_cpu = targets.cpu()                 # Для срезов
 
+                    # Создание нового конкатенированного тензора для outputs
                     for i in range(len(target_lengths_cpu)):
                         target_len_i = target_lengths_cpu[i].item()
                         if valid_indices[i]:
@@ -578,17 +584,15 @@ if __name__ == "__main__":
             processed_samples_train += batch_size_processed
 
             # Логирование батча
-            if (batch_idx + 1) % 100 == 0: # Логируем реже
+            if (batch_idx + 1) % 1000 == 0: # Логируем реже
                  global_step = epoch * len(train_dataloader) + batch_idx
                  writer.add_scalar('Loss/train_batch', loss.item(), global_step)
-                 # print(f"DEBUG: Logged train_batch loss at step {global_step}") # Отладочный вывод
 
         avg_train_loss = train_loss_accum / processed_samples_train if processed_samples_train > 0 else float('inf')
 
         # Валидация 
         # Переключаем модель в eval режим ВНУТРИ evaluate_wer
         epoch_wer, val_refs, val_preds = evaluate_wer(model, val_dataloader, device, index_map)
-        # evaluate_wer возвращает модель в режим train в конце
 
         epoch_duration = time.time() - start_time_epoch
 
@@ -614,11 +618,13 @@ if __name__ == "__main__":
         if epoch_wer < best_val_wer:
             cur_epoch = epoch
             best_val_wer = epoch_wer
-            torch.save(model.state_dict(), f"/kaggle/working/asr_ctc_model_epoch{cur_epoch}_WER.pth")
+            MODEL_SAVE_PATH = f"./models/asr_improved_layers{NUM_LAYERS}_hd{HIDDEN_DIM}_epoch{cur_epoch}_WER{int(epoch_wer)}.pth"
+            torch.save(model.state_dict(), MODEL_SAVE_PATH)
             print(f"  Validation WER улучшился до {best_val_wer:.2f}%. Модель сохранена.")
             epochs_no_improve = 0
         else:
             epochs_no_improve += 1
+            torch.save(model.state_dict(), f"./models/asr_unchanged_layers{NUM_LAYERS}_hd{HIDDEN_DIM}_epoch{cur_epoch}_WER{int(epoch_wer)}.pth")
             print(f"  Validation WER не улучшился. Эпох без улучшения: {epochs_no_improve}/{PATIENCE_EARLY_STOPPING}")
 
         if epochs_no_improve >= PATIENCE_EARLY_STOPPING:
@@ -629,28 +635,3 @@ if __name__ == "__main__":
 
     writer.close()
     print(f"Обучение завершено. Лучший Validation WER: {best_val_wer:.2f}% сохранен в {MODEL_SAVE_PATH}")
-
-    # Финальная оценка (загружаем лучшую модель)
-    print("\n Финальная оценка лучшей модели")
-    try:
-        model.load_state_dict(torch.load(MODEL_SAVE_PATH, map_location=device))
-        print(f"Модель {MODEL_SAVE_PATH} успешно загружена.")
-        final_wer, final_refs, final_preds = evaluate_wer(model, val_dataloader, device, index_map)
-
-        if final_wer != float('inf'):
-            print(f"\nИтоговый WER лучшей модели на валидационной выборке: {final_wer:.2f}%")
-            measures = jiwer.compute_measures(final_refs, final_preds)
-            print(f"MER: {measures['mer']:.4f}, WIL: {measures['wil']:.4f}")
-            print(f"Вставки: {measures['insertions']}, Удаления: {measures['deletions']}, Замены: {measures['substitutions']}")
-            # Сохранение результатов
-            results_df = pd.DataFrame({'reference': final_refs, 'prediction': final_preds})
-            results_df.to_csv('final_wer_results.csv', index=False, encoding='utf-8')
-            print("Детальные результаты сохранены в final_wer_results.csv")
-        else:
-            print("Не удалось рассчитать финальный WER.")
-    except FileNotFoundError:
-        print(f"Не найден файл лучшей модели: {MODEL_SAVE_PATH}.")
-    except Exception as e:
-        print(f"Ошибка при финальной оценке: {e}")
-        import traceback
-        traceback.print_exc()
