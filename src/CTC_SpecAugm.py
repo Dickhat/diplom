@@ -1,13 +1,16 @@
 import os
+import time
+
 import pandas as pd
+import numpy as np
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader, Subset, ConcatDataset, random_split
 from torch.nn.utils.rnn import pad_sequence
+
 import librosa
-import numpy as np
-import time
 from tqdm import tqdm
 import jiwer
 
@@ -50,7 +53,6 @@ def int_to_text(indices, index_map, blank_char=BLANK_CHAR):
     return text
 
 # Улучшенная обработка аудио (возвращает F, T)
-
 def preprocess_audio(audio_path, sample_rate=16000, n_mels=80, n_fft=400, hop_length=160):
     """Загружает аудио, преобразует в лог-мел-спектрограмму и нормализует."""
 
@@ -168,7 +170,6 @@ class ASR_CTC_Model(nn.Module):
         # Итого T_out = T_in / 4
         return lengths
 
-
 class SingleSourceAudioDataset(Dataset):
     def __init__(self, annotation_file, audio_dir, char_map, apply_augmentation=False, freq_mask_param=27, time_mask_param=70):
         """ Работает с ОДНИМ файлом аннотации и ОДНОЙ аудио директорией. """
@@ -226,70 +227,6 @@ class SingleSourceAudioDataset(Dataset):
             return log_mel_spectrogram, label_tensor, label_text.lower()
         except Exception as e: 
             print(f"Ошибка в __getitem__ (idx={idx}): {e}"); return None, None, None
-
-# Dataset для АУГМЕНТАЦИИ и возврата текста
-class CustomAudioDataset(Dataset):
-    def __init__(self, annotations_file, audio_dir, char_map, apply_augmentation=False, freq_mask_param=27, time_mask_param=70):
-        self.audio_target = pd.read_csv(annotations_file)
-
-        self.audio_target.dropna(subset=['text'], inplace=True)
-        self.audio_target = self.audio_target[self.audio_target['text'].str.strip() != '']
-
-        self.audio_dir = audio_dir
-        self.char_map = char_map
-        self.apply_augmentation = apply_augmentation
-
-        # Аугментация
-        if self.apply_augmentation:
-            self.spec_augment = nn.Sequential(
-                T.FrequencyMasking(freq_mask_param=freq_mask_param),
-                T.TimeMasking(time_mask_param=time_mask_param)
-            ).eval() # Переводим в eval(), чтобы dropout внутри не работал, если он там есть
-            print(f"Аугментация SpecAugment ({freq_mask_param=}, {time_mask_param=}) включена для этого датасета.")
-        else:
-            self.spec_augment = None
-            print("Аугментация SpecAugment выключена для этого датасета.")
-
-        print(f"Загружено {len(self.audio_target)} записей после очистки.")
-
-    def __len__(self):
-        return len(self.audio_target)
-
-    def __getitem__(self, idx):
-        if idx >= len(self.audio_target): # Проверка индекса
-            raise IndexError("Индекс за пределами датасета")
-        
-        audio_filename = self.audio_target.iloc[idx, 0]
-        potential_path_opus = os.path.join(self.audio_dir, audio_filename + ".opus")
-
-        if not os.path.exists(potential_path_opus):
-            # print(f"Аудиофайл не найден для {audio_filename}")
-            return None, None, None
-
-        # Предобработка возвращает (F, T) или None
-        log_mel_spectrogram = preprocess_audio(potential_path_opus)
-        if log_mel_spectrogram is None:
-            return None, None, None
-
-        # Применяем аугментацию, если нужно
-        if self.apply_augmentation and self.spec_augment is not None:
-            try:
-                log_mel_spectrogram = self.spec_augment(log_mel_spectrogram)
-            except Exception as e:
-                print(f"Ошибка аугментации файла {audio_filename}: {e}")
-                return None, None, None # Пропускаем при ошибке аугментации
-
-        label_text = self.audio_target.iloc[idx, 1]
-        # Проверка на NaN или float перед кодированием текста
-        if not isinstance(label_text, str):
-             # print(f"Предупреждение: Некорректная метка '{label_text}' для файла {audio_filename}, пропускаем.")
-             return None, None, None
-        
-        label_int = text_to_int(label_text, self.char_map)
-        label_tensor = torch.tensor(label_int, dtype=torch.long)
-
-        # Возвращаем 3 элемента
-        return log_mel_spectrogram, label_tensor, label_text.lower()
 
 # collate_fn для обработки формата (F, T) и преобразования в 5 элементов
 def collate_fn_asr_wer(batch):
@@ -412,8 +349,7 @@ if __name__ == "__main__":
     TIME_MASK_PARAM = 70                                    # Аугментация по времени
 
     data_sources = [
-        ("/kaggle/input/audiosets/dataset_target.csv", "/kaggle/input/audiosets/asr_public_phone_calls_1/asr_public_phone_calls_1/0"),
-        ("/kaggle/input/russian-asr-golos/golos/golos/dataset_target.csv", "/kaggle/input/russian-asr-golos/golos/0")
+        ("F:/asr_public_phone_calls_1/dataset_target.csv", "F:/asr_public_phone_calls_1/0")
         ]
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -513,10 +449,10 @@ if __name__ == "__main__":
             if inputs.numel() == 0 or targets_concat.numel() == 0:
                  continue
 
-            inputs = inputs.to(device, non_blocking=True)
-            targets = targets_concat.to(device, non_blocking=True)
-            input_lengths = input_lengths_T.to(device, non_blocking=True)
-            target_lengths = target_lengths.to(device, non_blocking=True)
+            inputs = inputs.to(device, non_blocking=True)                   # Мэл-спектрограммы
+            targets = targets_concat.to(device, non_blocking=True)          # Целевая конкатенированная последовательность
+            input_lengths = input_lengths_T.to(device, non_blocking=True)   # Длины исходных мэл-спектрограмм
+            target_lengths = target_lengths.to(device, non_blocking=True)   # Длины исходных целевых последовательностей
 
             optimizer.zero_grad()
 

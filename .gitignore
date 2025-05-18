@@ -3,5 +3,7 @@ runs
 asr*
 temp
 dataset_target.csv
-transcription*
 models*
+*.png
+*.txt
+.gitignore

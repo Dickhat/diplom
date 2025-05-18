@@ -14,11 +14,31 @@ import torch.nn as nn
 import librosa
 from transformers import WhisperFeatureExtractor, WhisperForConditionalGeneration, WhisperTokenizer, WhisperProcessor, WhisperForConditionalGeneration
 
+from pyctcdecode import build_ctcdecoder
+
+
 # КОНСТАНТЫ И ФУНКЦИИ МОДЕЛИ 
 RUSSIAN_ALPHABET = "_абвгдеёжзийклмнопрстуфхцчшщъыьэюя "
 BLANK_CHAR = '_'
 char_map = {char: idx for idx, char in enumerate(RUSSIAN_ALPHABET)}
 index_map = {idx: char for char, idx in char_map.items()}
+
+labels = [char for char in RUSSIAN_ALPHABET]
+BEAM_WIDTH = 200 # Ширина луча, можно экспериментировать (5, 10, 50, 100, 200)
+
+# Инициализация декодера с Beam Search
+print("Инициализация CTC Beam Search декодера...")
+try:
+    ctc_decoder = build_ctcdecoder(
+        labels=labels,
+        kenlm_model_path= None,
+    )
+    print("CTC Beam Search декодер инициализирован.")
+    USE_BEAM_SEARCH = True
+except Exception as e:
+    print(f"Ошибка инициализации CTC Beam Search декодера: {e}. Beam Search будет недоступен.")
+    ctc_decoder = None
+    USE_BEAM_SEARCH = False
 
 def text_to_int(text, char_map):
     text = text.lower()
@@ -46,8 +66,6 @@ def int_to_text(indices, index_map, blank_char=BLANK_CHAR):
 # Функция предобработки для получения лог-мел-спетрограммы
 def preprocess_buffer(audio_chunk: np.ndarray, sample_rate=16000, n_mels=80, n_fft=400, hop_length=160):
     """Преобразует NumPy массив аудио в лог-мел-спектрограмму (F, T)."""
-    # Ожидаем, что audio_chunk уже имеет нужную sample_rate (16000)
-    # и достаточную длину (>= n_fft), так как он формируется из буфера
 
     # Убедимся, что данные в формате float32, как ожидает librosa
     if audio_chunk.dtype != np.float32:
@@ -63,10 +81,12 @@ def preprocess_buffer(audio_chunk: np.ndarray, sample_rate=16000, n_mels=80, n_f
     except Exception as e:
          print(f"Ошибка при вычислении melspectrogram из буфера: {e}")
          return None
+    
     if np.max(mel_spectrogram) < 1e-10: return None # Пропускаем тишину
 
     log_mel_spectrogram = librosa.power_to_db(mel_spectrogram, ref=np.max)
-    mean = np.mean(log_mel_spectrogram); std = np.std(log_mel_spectrogram)
+    mean = np.mean(log_mel_spectrogram)
+    std = np.std(log_mel_spectrogram)
     
     if std < 1e-6: 
         return None
@@ -153,12 +173,13 @@ class ASR_CTC_Model(nn.Module):
 
 # ПАРАМЕТРЫ МОДЕЛИ И ПУТЬ
 INPUT_DIM = 80
-HIDDEN_DIM = 768 # Используем значение из вашего описания
+HIDDEN_DIM = 1024 # Число нейронов в скрытом слое LSTM
 OUTPUT_DIM = len(RUSSIAN_ALPHABET)
-NUM_LAYERS = 4
-DROPOUT = 0.3    # Используем значение из вашего описания
-MODEL_LOAD_PATH = "C:/Users/danya/Downloads/asr_ctc_model_epoch11_WER55.pth" # Пример
-
+NUM_LAYERS = 3    # Число слоев LSTM
+DROPOUT = 0.3   
+MODEL_LOAD_PATH = "D:/models/ASR_CTC_MODEL_1024_3layer_GOLOS, common voice, sova ai, librispeech\gslc_asr_ctc_model_1024_3layer_epoch12_WER16.87.pth"
+#MODEL_LOAD_PATH = "D:/models/ASR_CTC_MODEL_1024_3layer_GOLOS/asr_ctc_model_1024_3layer_epoch11_WER9.72.pth" # Пример
+#MODEL_LOAD_PATH = "D:/models/ASR_CTC_MODEL_1024_3layer_GOLOS_OPEN_STT/asr_ctc_model_1024_3layer_epoch8_WER32.68.pth"
 # ОПРЕДЕЛЕНИЕ УСТРОЙСТВА
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Используется устройство для инференса: {device}")
@@ -181,7 +202,7 @@ except Exception as e:
 
 # Функция транскрибации чанка
 @torch.no_grad() # Отключаем градиенты для инференса
-def transcribe_chunk(audio_chunk, model, device, index_map):
+def transcribe_chunk(audio_chunk, model, device, index_map, ctc_decoder_instance, beam_width=200):
     """Транскрибирует один чанк аудио (NumPy array)."""
     if model is None: # Если модель не загрузилась
         return "[Модель не загружена]"
@@ -208,11 +229,33 @@ def transcribe_chunk(audio_chunk, model, device, index_map):
             # print("Нулевая длина выхода модели.")
             return "" # Пустая строка, если выход нулевой
 
+        # Обрезаем выход до реальной длины
+        actual_output_len = output_lengths[0].item()
+        logits_for_decoder = outputs.squeeze(0)[:actual_output_len] # (T_out_actual, C)
+
+        # # ---> Beam Search Decoding <---
+        # if ctc_decoder_instance:
+        #     try:
+        #         beam_search_text = ctc_decoder_instance.decode(
+        #             logits_for_decoder.cpu().numpy(), # Передаем NumPy массив
+        #             beam_width=beam_width
+        #         )
+
+        #         print(f"Beam Search: '{beam_search_text}'") # Для отладки
+
+        #         return beam_search_text
+        #     except Exception as e:
+        #         print(f"Ошибка Beam Search декодирования: {e}. Используется Greedy.")
+
+
         # Greedy декодирование
         pred_indices = torch.argmax(outputs, dim=2).squeeze(0) # (T_out)
         pred_indices_cpu = pred_indices[:output_lengths[0]].cpu().tolist() # Обрезаем и переносим на CPU
-
         decoded_text = int_to_text(pred_indices_cpu, index_map)
+
+        # print(f"Greedy Decoding: '{decoded_text}'") # Для отладки
+        # print(f"Beam Search: '{beam_search_text}'") # Для отладки
+
         return decoded_text
 
     except Exception as e:
@@ -223,12 +266,12 @@ QUEUE_END_MARKER = object()
 
 # Класс GUI приложения
 class AudioApp:
-    def __init__(self, root, loaded_model, feauture_extractor, model, tokenizer):
+    def __init__(self, root, loaded_model, feauture_extractor=None, whisper_model=None, tokenizer=None):
         self.root = root
         self.root.title("Автоматическая транскрибация речи")
         self.model = loaded_model # Модель для моей
         self.whisper_feature_extractor = feauture_extractor
-        self.whisper_model = model
+        self.whisper_model = whisper_model
         self.whisper_tokenizer = tokenizer
         self.device = device      # CPU или GPU
 
@@ -305,17 +348,21 @@ class AudioApp:
 
             # Берем ровно samples_per_chunk
             chunk_to_process = concatenated_audio[:self.samples_per_chunk]
+            
             # Оставшиеся данные возвращаем в буфер
             remaining_audio = concatenated_audio[self.samples_per_chunk:]
+
+            # Хвост аудиоданных для обработки с "памятью"
+            tail_audio = chunk_to_process[-1600:]
 
             # Кладем готовый чанк в очередь
             self.audio_queue.put(chunk_to_process)
 
             # Обновляем внутренний буфер
             if remaining_audio.size > 0:
-                self.internal_buffer = [remaining_audio]
+                self.internal_buffer = [tail_audio, remaining_audio]
             else:
-                self.internal_buffer = []
+                self.internal_buffer = [tail_audio]
 
     def toggle_recording(self):
         if not self.is_recording:
@@ -436,7 +483,9 @@ class AudioApp:
         """Поток, который берет чанки из очереди и транскрибирует их."""
         print("Поток обработки очереди запущен.")
 
-        forced_decoder_ids = self.whisper_tokenizer.get_decoder_prompt_ids(language="ru", task="transcribe")
+        if self.whisper_model:
+            forced_decoder_ids = self.whisper_tokenizer.get_decoder_prompt_ids(language="ru", task="transcribe")
+
         transcribed_text = ""
         while True:
             try:
@@ -453,32 +502,32 @@ class AudioApp:
 
                 if db < -50:  
                     self.audio_queue.task_done()
-                    print("Тишина, пропускаем...")
-                    print(f"db {db}")
+                    #print("Тишина, пропускаем...")
+                    #print(f"db {db}")
                     continue
                 
-                print(f"Не шум db {db}")
+                #print(f"Не шум db {db}")
 
-                feature = self.whisper_feature_extractor(audio_chunk, sampling_rate=16000, language="ru", return_tensors="pt").input_features
-                feature = feature.to(self.device)
+                if self.whisper_model:
+                    feature = self.whisper_feature_extractor(audio_chunk, sampling_rate=16000, language="ru", return_tensors="pt").input_features
+                    feature = feature.to(self.device)
 
-                generated_tokens =self.whisper_model.generate(input_features=feature, forced_decoder_ids=forced_decoder_ids)
-                
-                transcribed_text = self.whisper_tokenizer.batch_decode(generated_tokens.cpu(), skip_special_tokens=True)[0]
+                    generated_tokens =self.whisper_model.generate(input_features=feature, forced_decoder_ids=forced_decoder_ids)
+                    
+                    transcribed_text = self.whisper_tokenizer.batch_decode(generated_tokens.cpu(), skip_special_tokens=True)[0]
+                else:
+                    # Транскрибация моей моделью
+                    transcribed_text = transcribe_chunk(audio_chunk, self.model, self.device, index_map, ctc_decoder, beam_width=BEAM_WIDTH)
 
-                # Транскрибация моей моделью
-                #start_time = time.time()
                 #transcribed_text = transcribe_chunk(audio_chunk, self.model, self.device, index_map)
-                #end_time = time.time()
-                # print(f"Транскрибация чанка ({end_time - start_time:.2f} сек): '{transcribed_text}'")
 
                 # Обновление GUI
                 if transcribed_text and transcribed_text not in ["[Ошибка обработки]", "[Ошибка инференса]", "[Модель не загружена]"]:
-                    self.transcription_queue.put(transcribed_text + " ")
+                    self.transcription_queue.put(transcribed_text)
 
                 self.audio_queue.task_done()
             except Exception as e:
-                print(f" Очередь пустая: {e}")
+                #print(f" Очередь пустая: {e}")
                 time.sleep(0.1) # Небольшая пауза при ошибке    
         
         try: 
@@ -545,22 +594,28 @@ class AudioApp:
         self.root.destroy()     # Закрытие окна
 
 if __name__ == "__main__":
-    # tiny
+    whisper_model = None
+    feauture_extractor = None
+    tokenizer = None
+
+    # whisper-tiny
     # feauture_extractor = WhisperFeatureExtractor.from_pretrained("models--openai--whisper-tiny/snapshots/169d4a4341b33bc18d8881c4b69c2e104e1cc0af")
     # whisper_model = WhisperForConditionalGeneration.from_pretrained("models--openai--whisper-tiny/snapshots/169d4a4341b33bc18d8881c4b69c2e104e1cc0af")
     # tokenizer = WhisperTokenizer.from_pretrained("models--openai--whisper-tiny/snapshots/169d4a4341b33bc18d8881c4b69c2e104e1cc0af", language = "russian", task="transcribe")
 
-    # openai/whisper-large-v3-turbo
-    feauture_extractor = WhisperFeatureExtractor.from_pretrained("models--openai--whisper-large-v3-turbo/snapshots/41f01f3fe87f28c78e2fbf8b568835947dd65ed9")
-    whisper_model = WhisperForConditionalGeneration.from_pretrained("models--openai--whisper-large-v3-turbo/snapshots/41f01f3fe87f28c78e2fbf8b568835947dd65ed9")
-    tokenizer = WhisperTokenizer.from_pretrained("models--openai--whisper-large-v3-turbo/snapshots/41f01f3fe87f28c78e2fbf8b568835947dd65ed9", language = "russian", task="transcribe")
+    # whisper-large-v3-turbo
+    # feauture_extractor = WhisperFeatureExtractor.from_pretrained("models--openai--whisper-large-v3-turbo/snapshots/41f01f3fe87f28c78e2fbf8b568835947dd65ed9")
+    # whisper_model = WhisperForConditionalGeneration.from_pretrained("models--openai--whisper-large-v3-turbo/snapshots/41f01f3fe87f28c78e2fbf8b568835947dd65ed9")
+    # tokenizer = WhisperTokenizer.from_pretrained("models--openai--whisper-large-v3-turbo/snapshots/41f01f3fe87f28c78e2fbf8b568835947dd65ed9", language = "russian", task="transcribe")
     
-    whisper_model.to(device)
+    # whisper_model.to(device)
 
-    #if model is None:
-    #    print("Модель не была загружена. Запустите скрипт заново, указав правильный путь.")
-    #else:
     root = tk.Tk()
-    app = AudioApp(root, model, feauture_extractor, whisper_model, tokenizer) # Передаем загруженную модель в приложение
+
+    if whisper_model:
+        app = AudioApp(root, model, feauture_extractor, whisper_model, tokenizer) # Передаем загруженную модель в приложение
+    else:
+        app = AudioApp(root, model)
+    
     root.protocol("WM_DELETE_WINDOW", app.on_closing) # Обработка закрытия окна
     root.mainloop()
