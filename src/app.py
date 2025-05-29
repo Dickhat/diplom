@@ -1,5 +1,5 @@
 import tkinter as tk
-from tkinter import ttk, filedialog
+from tkinter import ttk, filedialog, messagebox
 import sounddevice as sd
 import numpy as np
 import threading
@@ -12,33 +12,13 @@ import time
 import torch
 import torch.nn as nn
 import librosa
-from transformers import WhisperFeatureExtractor, WhisperForConditionalGeneration, WhisperTokenizer, WhisperProcessor, WhisperForConditionalGeneration
-
-from pyctcdecode import build_ctcdecoder
-
+from transformers import WhisperFeatureExtractor, WhisperTokenizer, WhisperProcessor, WhisperForConditionalGeneration
 
 # КОНСТАНТЫ И ФУНКЦИИ МОДЕЛИ 
 RUSSIAN_ALPHABET = "_абвгдеёжзийклмнопрстуфхцчшщъыьэюя "
 BLANK_CHAR = '_'
 char_map = {char: idx for idx, char in enumerate(RUSSIAN_ALPHABET)}
 index_map = {idx: char for char, idx in char_map.items()}
-
-labels = [char for char in RUSSIAN_ALPHABET]
-BEAM_WIDTH = 200 # Ширина луча, можно экспериментировать (5, 10, 50, 100, 200)
-
-# Инициализация декодера с Beam Search
-print("Инициализация CTC Beam Search декодера...")
-try:
-    ctc_decoder = build_ctcdecoder(
-        labels=labels,
-        kenlm_model_path= None,
-    )
-    print("CTC Beam Search декодер инициализирован.")
-    USE_BEAM_SEARCH = True
-except Exception as e:
-    print(f"Ошибка инициализации CTC Beam Search декодера: {e}. Beam Search будет недоступен.")
-    ctc_decoder = None
-    USE_BEAM_SEARCH = False
 
 def text_to_int(text, char_map):
     text = text.lower()
@@ -76,6 +56,19 @@ def preprocess_buffer(audio_chunk: np.ndarray, sample_rate=16000, n_mels=80, n_f
         padding_needed = n_fft - len(audio_chunk)
         audio_chunk = np.pad(audio_chunk, (0, padding_needed), mode='constant', constant_values=0)
 
+    # import matplotlib.pyplot as plt
+
+
+    # # Построим график амплитудных отсчётов
+    # plt.figure(figsize=(10, 4))
+    # plt.plot(audio_chunk)
+    # plt.title("Амплитудные отсчёты аудиосигнала")
+    # plt.xlabel("Номер отсчёта")
+    # plt.ylabel("Амплитуда")
+    # plt.grid(True)
+    # plt.tight_layout()
+    # plt.show()
+
     try:
         mel_spectrogram = librosa.feature.melspectrogram(y=audio_chunk, sr=sample_rate, n_fft=n_fft, hop_length=hop_length, n_mels=n_mels, fmax=8000)
     except Exception as e:
@@ -85,6 +78,7 @@ def preprocess_buffer(audio_chunk: np.ndarray, sample_rate=16000, n_mels=80, n_f
     if np.max(mel_spectrogram) < 1e-10: return None # Пропускаем тишину
 
     log_mel_spectrogram = librosa.power_to_db(mel_spectrogram, ref=np.max)
+
     mean = np.mean(log_mel_spectrogram)
     std = np.std(log_mel_spectrogram)
     
@@ -177,9 +171,9 @@ HIDDEN_DIM = 1024 # Число нейронов в скрытом слое LSTM
 OUTPUT_DIM = len(RUSSIAN_ALPHABET)
 NUM_LAYERS = 3    # Число слоев LSTM
 DROPOUT = 0.3   
-MODEL_LOAD_PATH = "D:/models/ASR_CTC_MODEL_1024_3layer_GOLOS, common voice, sova ai, librispeech\gslc_asr_ctc_model_1024_3layer_epoch12_WER16.87.pth"
-#MODEL_LOAD_PATH = "D:/models/ASR_CTC_MODEL_1024_3layer_GOLOS/asr_ctc_model_1024_3layer_epoch11_WER9.72.pth" # Пример
-#MODEL_LOAD_PATH = "D:/models/ASR_CTC_MODEL_1024_3layer_GOLOS_OPEN_STT/asr_ctc_model_1024_3layer_epoch8_WER32.68.pth"
+#MODEL_LOAD_PATH = "D:/models/1024_3layer_all_datasets/all_data_1024_3layer_epoch9_WER29.26.pth"
+MODEL_LOAD_PATH = "D:/models/ASR_CTC_MODEL_1024_3layer_GOLOS, common voice, sova ai, librispeech/gslc_asr_ctc_model_1024_3layer_epoch20_WER11.60.pth" # Пример
+
 # ОПРЕДЕЛЕНИЕ УСТРОЙСТВА
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Используется устройство для инференса: {device}")
@@ -202,7 +196,7 @@ except Exception as e:
 
 # Функция транскрибации чанка
 @torch.no_grad() # Отключаем градиенты для инференса
-def transcribe_chunk(audio_chunk, model, device, index_map, ctc_decoder_instance, beam_width=200):
+def transcribe_chunk(audio_chunk, model, device, index_map):
     """Транскрибирует один чанк аудио (NumPy array)."""
     if model is None: # Если модель не загрузилась
         return "[Модель не загружена]"
@@ -229,32 +223,11 @@ def transcribe_chunk(audio_chunk, model, device, index_map, ctc_decoder_instance
             # print("Нулевая длина выхода модели.")
             return "" # Пустая строка, если выход нулевой
 
-        # Обрезаем выход до реальной длины
-        actual_output_len = output_lengths[0].item()
-        logits_for_decoder = outputs.squeeze(0)[:actual_output_len] # (T_out_actual, C)
-
-        # # ---> Beam Search Decoding <---
-        # if ctc_decoder_instance:
-        #     try:
-        #         beam_search_text = ctc_decoder_instance.decode(
-        #             logits_for_decoder.cpu().numpy(), # Передаем NumPy массив
-        #             beam_width=beam_width
-        #         )
-
-        #         print(f"Beam Search: '{beam_search_text}'") # Для отладки
-
-        #         return beam_search_text
-        #     except Exception as e:
-        #         print(f"Ошибка Beam Search декодирования: {e}. Используется Greedy.")
-
-
+        
         # Greedy декодирование
         pred_indices = torch.argmax(outputs, dim=2).squeeze(0) # (T_out)
         pred_indices_cpu = pred_indices[:output_lengths[0]].cpu().tolist() # Обрезаем и переносим на CPU
         decoded_text = int_to_text(pred_indices_cpu, index_map)
-
-        # print(f"Greedy Decoding: '{decoded_text}'") # Для отладки
-        # print(f"Beam Search: '{beam_search_text}'") # Для отладки
 
         return decoded_text
 
@@ -313,6 +286,15 @@ class AudioApp:
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self.transcription_text['yscrollcommand'] = scrollbar.set
 
+        try:
+            default_input = sd.default.device[0]  # индекс устройства ввода
+            if default_input is None or default_input < 0:
+                messagebox.showwarning("Внимание", "Микрофон не найден!")
+            else:
+                messagebox.showinfo("Уведомление", "Микрофон подключен!")
+        except:
+            messagebox.showwarning("Внимание", "Микрофон не найден!")
+
         # Очередь и буфер
         self.audio_queue = queue.Queue()
         self.transcription_queue = queue.Queue()
@@ -353,16 +335,16 @@ class AudioApp:
             remaining_audio = concatenated_audio[self.samples_per_chunk:]
 
             # Хвост аудиоданных для обработки с "памятью"
-            tail_audio = chunk_to_process[-1600:]
+            #tail_audio = chunk_to_process[-1600:]
 
             # Кладем готовый чанк в очередь
             self.audio_queue.put(chunk_to_process)
 
             # Обновляем внутренний буфер
             if remaining_audio.size > 0:
-                self.internal_buffer = [tail_audio, remaining_audio]
+                self.internal_buffer = [remaining_audio] #[tail_audio, remaining_audio]
             else:
-                self.internal_buffer = [tail_audio]
+                self.internal_buffer = [] #[tail_audio]
 
     def toggle_recording(self):
         if not self.is_recording:
@@ -399,6 +381,8 @@ class AudioApp:
                         sd.sleep(100) # Небольшая пауза, чтобы не грузить CPU
                 print("Поток записи завершен.")
             except Exception as e:
+                messagebox.showerror("Ошибка", "Запись не может быть начата без записывающего устройства")
+
                 print(f"Ошибка в потоке записи: {e}")
                 self.root.after(0, self.stop_recording) # Вызываем stop_recording в главном потоке
 
@@ -500,7 +484,7 @@ class AudioApp:
                 rms = np.sqrt(np.mean(audio_chunk**2))  # Корень из среднего квадрата — RMS
                 db = 20 * np.log10(rms + 1e-9)          # Преобразуем в dB, добавляем ε чтобы не делить на 0
 
-                if db < -50:  
+                if db < -60:  
                     self.audio_queue.task_done()
                     #print("Тишина, пропускаем...")
                     #print(f"db {db}")
@@ -517,9 +501,7 @@ class AudioApp:
                     transcribed_text = self.whisper_tokenizer.batch_decode(generated_tokens.cpu(), skip_special_tokens=True)[0]
                 else:
                     # Транскрибация моей моделью
-                    transcribed_text = transcribe_chunk(audio_chunk, self.model, self.device, index_map, ctc_decoder, beam_width=BEAM_WIDTH)
-
-                #transcribed_text = transcribe_chunk(audio_chunk, self.model, self.device, index_map)
+                    transcribed_text = transcribe_chunk(audio_chunk, self.model, self.device, index_map)
 
                 # Обновление GUI
                 if transcribed_text and transcribed_text not in ["[Ошибка обработки]", "[Ошибка инференса]", "[Модель не загружена]"]:
@@ -542,7 +524,7 @@ class AudioApp:
         try:
             while True: # Обрабатываем все сообщения в очереди
                 text_to_add = self.transcription_queue.get_nowait()
-                self.update_transcription_widget(text_to_add)
+                self.update_transcription_widget(text_to_add + " ")
         except queue.Empty:
             pass # Очередь пуста
         except Exception as e:
@@ -613,9 +595,9 @@ if __name__ == "__main__":
     root = tk.Tk()
 
     if whisper_model:
-        app = AudioApp(root, model, feauture_extractor, whisper_model, tokenizer) # Передаем загруженную модель в приложение
+        app = AudioApp(root, model, feauture_extractor, whisper_model, tokenizer) # Загруженная модель Whisper
     else:
-        app = AudioApp(root, model)
+        app = AudioApp(root, model) # Загруженная модель моя
     
     root.protocol("WM_DELETE_WINDOW", app.on_closing) # Обработка закрытия окна
     root.mainloop()
