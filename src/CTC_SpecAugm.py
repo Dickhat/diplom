@@ -99,19 +99,26 @@ def preprocess_audio(audio_path, sample_rate=16000, n_mels=80, n_fft=400, hop_le
 class ASR_CTC_Model(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim, num_layers=3, dropout=0.15):
         super(ASR_CTC_Model, self).__init__()
-        # Слои Conv2d ожидают вход (B, C, H, W) или (B, C, F, T)
+        # Обновленный сверточный блок
         self.conv_layers = nn.Sequential(
             # Вход: (B, C=1, F=input_dim, T=time)
-            nn.Conv2d(1, 32, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1)), # -> (B, 32, F/2, T/2)
-            nn.ReLU(),
+            nn.Conv2d(1, 32, kernel_size=(3, 3), stride=(2, 1), padding=(1, 1)),       # -> (B, 32, F/2, T)
+            nn.GELU(),
             nn.BatchNorm2d(32),
-            nn.Conv2d(32, 32, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1)), # -> (B, 32, F/4, T/4)
-            nn.ReLU(),
-            nn.BatchNorm2d(32)
+            nn.Conv2d(32, 32, kernel_size=(3, 3), stride=(2, 1), padding=(1, 1)),      # -> (B, 32, F/4, T)
+            nn.GELU(),
+            nn.BatchNorm2d(32),
+            nn.Conv2d(32, 64, kernel_size=(3, 3), stride=(1, 2), padding=(1, 1)),      # -> (B, 64, F/4, T/2)
+            nn.GELU(),
+            nn.BatchNorm2d(64),
+            nn.Conv2d(64, 64, kernel_size=(3, 3), stride=(1, 2), padding=(1, 1)),      # -> (B, 64, F/4, T/4)
+            nn.GELU(),
+            nn.BatchNorm2d(64)
         )
     
         # Расчет входной размерности для LSTM
-        lstm_input_dim = 32 * (input_dim // 4) # Каналы * (F уменьшается в 2 раза дважды)
+        # Каналы последнего сверточного слоя * (F уменьшается в 4 раза)
+        lstm_input_dim = 64 * (input_dim // 4)
 
         # Dropout слой
         self.conv_dropout = nn.Dropout(dropout)
@@ -157,17 +164,23 @@ class ASR_CTC_Model(nn.Module):
         """ Рассчитывает длину ВЫХОДА по оси T после сверток """
         lengths = input_lengths_T
 
-        # Уменьшение по оси T определяется stride[1] для Conv2d при входе (B, C, F, T)
-        
-        # Первый Conv: stride=(2, 2) -> stride[1]=2
+        # Проходим по сверточным слоям и применяем уменьшение длины, если stride по времени > 1
+        # Conv1: stride T = 1 (self.conv_layers[0])
         if isinstance(self.conv_layers[0], nn.Conv2d) and self.conv_layers[0].stride[1] > 1:
              lengths = torch.div(lengths - 1, self.conv_layers[0].stride[1], rounding_mode='floor') + 1
         
-        # Второй Conv: stride=(2, 2) -> stride[1]=2
+        # Conv2: stride T = 1 (self.conv_layers[3])
         if isinstance(self.conv_layers[3], nn.Conv2d) and self.conv_layers[3].stride[1] > 1:
              lengths = torch.div(lengths - 1, self.conv_layers[3].stride[1], rounding_mode='floor') + 1
 
-        # Итого T_out = T_in / 4
+        # Conv3: stride T = 2 (self.conv_layers[6])
+        if isinstance(self.conv_layers[6], nn.Conv2d) and self.conv_layers[6].stride[1] > 1:
+             lengths = torch.div(lengths - 1, self.conv_layers[6].stride[1], rounding_mode='floor') + 1
+
+        # Conv4: stride T = 2 (self.conv_layers[9])
+        if isinstance(self.conv_layers[9], nn.Conv2d) and self.conv_layers[9].stride[1] > 1:
+             lengths = torch.div(lengths - 1, self.conv_layers[9].stride[1], rounding_mode='floor') + 1
+             
         return lengths
 
 class SingleSourceAudioDataset(Dataset):
